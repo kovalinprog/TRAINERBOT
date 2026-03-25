@@ -104,10 +104,16 @@ def get_trainings_kb():
         free = t["slots"] - count
         short_date = format_date(t["date"])
 
-        text = f"{t['name']} {short_date} {t['time']} ({free})"
+        name = t['name'][:15] + "..." if len(t['name']) > 15 else t['name']
+        text = f"{name} {short_date} {t['time']} ({free})"
 
         kb.inline_keyboard.append([
             InlineKeyboardButton(text=text, callback_data=f"book_{t_id}")
+        ])
+
+    if not kb.inline_keyboard:
+        kb.inline_keyboard.append([
+            InlineKeyboardButton(text="Нет тренировок 😢", callback_data="empty")
         ])
 
     return kb
@@ -118,7 +124,9 @@ def get_delete_kb():
 
     for t_id, t in trainings.items():
         short_date = format_date(t["date"])
-        text = f"{t['name']} {short_date} {t['time']}"
+
+        name = t['name'][:15] + "..." if len(t['name']) > 15 else t['name']
+        text = f"{name} {short_date} {t['time']}"
 
         kb.inline_keyboard.append([
             InlineKeyboardButton(text=f"❌ {text}", callback_data=f"delete_{t_id}")
@@ -136,26 +144,13 @@ async def handle(message: types.Message, state: FSMContext):
         await message.answer("Меню 👇", reply_markup=get_main_kb(message.from_user.id))
 
     elif message.text == "💪🏻 Записаться":
-        now = datetime.now()
-        available = False
+        kb = get_trainings_kb()
 
-        for t_id, t in trainings.items():
-            dt = datetime.strptime(f"{t['date']} {t['time']}", "%d.%m.%Y %H:%M")
-            if dt < now:
-                continue
-
-            cursor.execute("SELECT COUNT(*) FROM bookings WHERE training_id=?", (t_id,))
-            count = cursor.fetchone()[0]
-
-            if count < t["slots"]:
-                available = True
-                break
-
-        if not available:
-            await message.answer("Нет доступных тренировок 😢")
+        if kb.inline_keyboard and kb.inline_keyboard[0][0].text == "Нет тренировок 😢":
+            await message.answer("Сейчас нет доступных тренировок 😢")
             return
 
-        await message.answer("Выбери тренировку:", reply_markup=get_trainings_kb())
+        await message.answer("Выбери тренировку:", reply_markup=kb)
 
     elif message.text == "✅ Мои записи":
         cursor.execute(
@@ -206,22 +201,24 @@ async def handle(message: types.Message, state: FSMContext):
 
         for t_id, t in trainings.items():
             cursor.execute(
-                "SELECT username FROM bookings WHERE training_id=?",
+                "SELECT user_id, username FROM bookings WHERE training_id=?",
                 (t_id,)
             )
             users = cursor.fetchall()
 
             short_date = format_date(t["date"])
-
             text += f"\n📌 {t['name']} {short_date} {t['time']}:\n"
 
             if not users:
                 text += "  никто не записан\n"
             else:
                 for u in users:
-                    text += f"  - {u[0]}\n"
+                    user_id = u[0]
+                    username = u[1]
 
-        await message.answer(text)
+                    text += f'  - <a href="tg://user?id={user_id}">{username}</a>\n'
+
+        await message.answer(text or "Пусто", parse_mode="HTML")
 
     elif message.text == "➕ Добавить тренировку":
         if message.from_user.id != ADMIN_ID:
@@ -298,11 +295,6 @@ async def callbacks(callback: types.CallbackQuery):
             await callback.message.answer("Тренировка не найдена ❌")
             return
 
-        dt = datetime.strptime(f"{trainings[t_id]['date']} {trainings[t_id]['time']}", "%d.%m.%Y %H:%M")
-        if dt < datetime.now():
-            await callback.message.answer("Тренировка уже прошла ❌")
-            return
-
         cursor.execute(
             "SELECT * FROM bookings WHERE user_id=? AND training_id=?",
             (user_id, t_id)
@@ -318,13 +310,26 @@ async def callbacks(callback: types.CallbackQuery):
             await callback.message.answer("Нет мест 😢")
             return
 
+        username = callback.from_user.username
+        if username:
+            username = "@" + username
+        else:
+            username = callback.from_user.full_name
+
         cursor.execute(
             "INSERT INTO bookings (user_id, username, training_id) VALUES (?, ?, ?)",
-            (user_id, callback.from_user.full_name, t_id)
+            (user_id, username, t_id)
         )
         conn.commit()
 
-        await callback.message.answer("Ты записан ✅")
+        t = trainings[t_id]
+        short_date = format_date(t["date"])
+
+        await callback.message.answer(
+            f"✅ Ты записан!\n\n{t['name']}\n📅 {short_date} ⏰ {t['time']}"
+        )
+
+        await callback.message.edit_reply_markup(reply_markup=get_trainings_kb())
 
     elif data.startswith("cancel_"):
         t_id = int(data.split("_")[1])
@@ -335,7 +340,17 @@ async def callbacks(callback: types.CallbackQuery):
         )
         conn.commit()
 
-        await callback.message.answer("Запись отменена ❌")
+        t = trainings.get(t_id)
+
+        if t:
+            short_date = format_date(t["date"])
+            text = f"{t['name']} {short_date} {t['time']}"
+        else:
+            text = ""
+
+        await callback.message.answer(f"❌ Запись отменена\n{text}")
+
+        await callback.message.edit_reply_markup(reply_markup=get_trainings_kb())
 
     elif data.startswith("delete_"):
         if user_id != ADMIN_ID:
@@ -357,15 +372,12 @@ async def callbacks(callback: types.CallbackQuery):
 
         short_date = format_date(t["date"])
 
-        notify_text = (
-            f"❌ Тренировка отменена\n\n"
-            f"{t['name']} {short_date} {t['time']}\n\n"
-            f"Извини 🙏"
-        )
-
         for u in users:
             try:
-                await bot.send_message(u[0], notify_text)
+                await bot.send_message(
+                    u[0],
+                    f"❌ Тренировка отменена\n\n{t['name']} {short_date} {t['time']}\n\nИзвини 🙏"
+                )
             except:
                 pass
 
