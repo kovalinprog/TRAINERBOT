@@ -7,8 +7,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.filters import StateFilter
 
-import os
-TOKEN = os.getenv("TOKEN")
+TOKEN = "8626742579:AAFp06-KUYOzJ_e-qGDRyuWn7Gvs-mzpVoQ"
 ADMIN_ID = 76038670
 
 bot = Bot(token=TOKEN)
