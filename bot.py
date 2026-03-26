@@ -8,7 +8,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.filters import StateFilter
 
 TOKEN = "8626742579:AAFp06-KUYOzJ_e-qGDRyuWn7Gvs-mzpVoQ"
-ADMIN_ID = 932779989
+ADMIN_ID = 76038670
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
