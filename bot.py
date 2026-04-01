@@ -248,6 +248,13 @@ async def reminder_loop():
 
         await asyncio.sleep(60)
 
+# ===== АВТООЧИСТКА =====
+async def cleanup_loop():
+    while True:
+        print(f"Проверка очистки: {datetime.now()}")
+        cleanup_trainings()
+        await asyncio.sleep(300)  # каждые 5 минут
+
 # ===== ОСНОВА =====
 @dp.message(StateFilter(None))
 async def handle(message: types.Message, state: FSMContext):
@@ -661,8 +668,9 @@ async def callbacks(callback: types.CallbackQuery):
 async def main():
     print("Бот запущен 🚀")
 
+    cleanup_trainings()  # 👈 сразу при старте
+
     asyncio.create_task(reminder_loop())
+    asyncio.create_task(cleanup_loop())  # 👈 ВОТ СЮДА
 
     await dp.start_polling(bot)
-
-asyncio.run(main())
