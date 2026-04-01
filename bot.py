@@ -653,7 +653,7 @@ async def callbacks(callback: types.CallbackQuery):
             try:
                 await bot.send_message(
                     ADMIN_ID,
-                    f"⚠️ Тренировка заполнена!\n\n{name} {date} {time}"
+                    f"⚠️ Все места заняты!\n\n{name} {date} {time}"
                 )
             except Exception as e:
                 print("Ошибка отправки админу:", e)
