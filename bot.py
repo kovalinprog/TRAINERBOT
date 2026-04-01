@@ -8,7 +8,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.filters import StateFilter
 
 TOKEN = "8626742579:AAFp06-KUYOzJ_e-qGDRyuWn7Gvs-mzpVoQ"
-ADMIN_ID = 76038670
+ADMIN_ID = 932779989
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
@@ -59,6 +59,15 @@ CREATE TABLE IF NOT EXISTS history (
 )
 """)
 
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS measurements (
+    user_id INTEGER,
+    username TEXT,
+    date TEXT,
+    weight REAL
+)
+""")
+
 conn.commit()
 
 # ===== FSM =====
@@ -67,6 +76,10 @@ class AddTraining(StatesGroup):
     date = State()
     time = State()
     slots = State()
+
+class AddMeasurement(StatesGroup):
+    date = State()
+    weight = State()
 
 # ===== ДАТА =====
 def format_date(date_str):
@@ -122,7 +135,8 @@ def get_main_kb(user_id):
         return ReplyKeyboardMarkup(
             keyboard=[
                 [KeyboardButton(text="💪🏻 Записаться")],
-                [KeyboardButton(text="✅ Мои записи")]
+                [KeyboardButton(text="✅ Мои записи")],
+                [KeyboardButton(text="📏 Добавить замеры")]  # ← для клиента
             ],
             resize_keyboard=True
         )
@@ -133,11 +147,13 @@ def get_admin_kb():
             [KeyboardButton(text="➕ Добавить тренировку")],
             [KeyboardButton(text="🗑️ Удалить тренировку")],
             [KeyboardButton(text="📋 Список участников")],
-            [KeyboardButton(text="📊 Посещения")],  # ← новая кнопка
+            [KeyboardButton(text="📊 Посещения")],
+            [KeyboardButton(text="📈 Отчет веса")],  # ← для админа
             [KeyboardButton(text="⬅️ Назад")]
         ],
         resize_keyboard=True
     )
+
 # ===== СПИСОК ТРЕНИРОВОК =====
 def get_trainings_kb():
     kb = InlineKeyboardMarkup(inline_keyboard=[])
@@ -333,6 +349,41 @@ async def handle(message: types.Message, state: FSMContext):
     elif message.text == "⬅️ Назад":
         await message.answer("Меню 👇", reply_markup=get_main_kb(message.from_user.id))
 
+    # ===== ДОБАВИТЬ ЗАМЕРЫ =====
+    elif message.text == "📏 Добавить замеры":
+        await message.answer("Введите дату замеров (дд.мм), без года:")
+        await state.set_state(AddMeasurement.date)
+
+    # ===== ОТЧЕТ ВЕСА ДЛЯ АДМИНА =====
+    elif message.text == "📈 Отчет веса" and message.from_user.id == ADMIN_ID:
+        cursor.execute("SELECT DISTINCT user_id, username FROM measurements")
+        users = cursor.fetchall()
+
+        if not users:
+            await message.answer("Нет данных о замерах")
+            return
+
+        text = ""
+        for user_id, username in users:
+            cursor.execute(
+                "SELECT date, weight FROM measurements WHERE user_id=? ORDER BY rowid",
+                (user_id,)
+            )
+            records = cursor.fetchall()
+            if not records:
+                continue
+
+            first_weight = records[0][1]
+            last_weight = records[-1][1]
+            diff = last_weight - first_weight
+
+            text += f"\n<a href='tg://user?id={user_id}'>{username}</a>:\n"
+            for date, weight in records:
+                text += f"  {date} — {weight} кг\n"
+            text += f"  Разница: {diff:+.1f} кг\n"
+
+        await message.answer(text, parse_mode="HTML")
+
     # ===== СПИСОК УЧАСТНИКОВ =====
     elif message.text == "📋 Список участников":
         if message.from_user.id != ADMIN_ID:
@@ -475,56 +526,62 @@ async def add_slots(message: types.Message, state: FSMContext):
     await message.answer("Тренировка добавлена ✅", reply_markup=get_admin_kb())
     await state.clear()
 
-# ===== CALLBACK =====
+# ===== FSM ХЕНДЛЕРЫ ДЛЯ ЗАМЕРОВ =====
+@dp.message(AddMeasurement.date)
+async def add_measurement_date(message: types.Message, state: FSMContext):
+    user_input = message.text.strip()
+    try:
+        datetime.strptime(user_input, "%d.%m")
+        await state.update_data(date=user_input)
+        await message.answer("Введите вес (кг), можно через точку или запятую:")
+        await state.set_state(AddMeasurement.weight)
+    except:
+        await message.answer("❌ Неверный формат даты! Введите дд.мм, например 25.03")
+        return
 
-# очередь ожидания
-@dp.callback_query(lambda c: c.data.startswith("wait_"))
-async def waitlist_add(callback: types.CallbackQuery):
+@dp.message(AddMeasurement.weight)
+async def add_measurement_weight(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    user_id = message.from_user.id
+    username = message.from_user.username or message.from_user.full_name
 
-    user_id = callback.from_user.id
-    t_id = int(callback.data.split("_")[1])
-
-    cursor.execute(
-        "SELECT * FROM waitlist WHERE user_id=? AND training_id=?",
-        (user_id, t_id)
-    )
-    if cursor.fetchone():
-        await callback.message.answer("Ты уже в списке ожидания ⏳")
+    weight_text = message.text.strip().replace(",", ".")
+    try:
+        weight = float(weight_text)
+    except:
+        await message.answer("❌ Неверный формат веса! Введите число через точку или запятую.")
         return
 
     cursor.execute(
-        "INSERT INTO waitlist VALUES (?, ?)",
-        (user_id, t_id)
+        "INSERT INTO measurements VALUES (?, ?, ?, ?)",
+        (user_id, username, data["date"], weight)
     )
     conn.commit()
 
-    await callback.message.answer("Ты добавлена в список ожидания ⏳")
-    await callback.answer()
+    await message.answer(f"📏 Замер добавлен: {data['date']} — {weight} кг")
+    await state.clear()
 
-
-# основная логика
-@dp.callback_query(lambda c: c.data.startswith(("book_", "cancel_", "delete_")))
+@dp.callback_query(lambda c: c.data.startswith(("book_", "cancel_", "delete_", "wait_")))
 async def callbacks(callback: types.CallbackQuery):
-
     cleanup_trainings()
     await callback.answer()
 
     user_id = callback.from_user.id
     data = callback.data
 
-    # ===== ЗАПИСЬ =====
+    # ===== ЗАПИСЬ НА ТРЕНИРОВКУ =====
     if data.startswith("book_"):
         t_id = int(data.split("_")[1])
 
         cursor.execute("SELECT * FROM trainings WHERE id=?", (t_id,))
         t = cursor.fetchone()
-
         if not t:
             await callback.message.answer("Не найдена ❌")
             return
 
         _, name, date, time, slots = t
 
+        # Проверяем, не записан ли уже пользователь
         cursor.execute(
             "SELECT * FROM bookings WHERE user_id=? AND training_id=?",
             (user_id, t_id)
@@ -533,29 +590,9 @@ async def callbacks(callback: types.CallbackQuery):
             await callback.message.answer("Ты уже записан")
             return
 
+        # Узнаём текущее количество записей
         cursor.execute("SELECT COUNT(*) FROM bookings WHERE training_id=?", (t_id,))
         count = cursor.fetchone()[0]
-
-        if count >= slots:
-
-            cursor.execute(
-                "SELECT * FROM waitlist WHERE user_id=? AND training_id=?",
-                (user_id, t_id)
-            )
-
-            if cursor.fetchone():
-                await callback.message.answer("Ты уже в списке ожидания ⏳")
-                return
-
-            kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="⏳ Встать в очередь", callback_data=f"wait_{t_id}")]
-            ])
-
-            await callback.message.answer(
-                "Мест нет 😢\n\nХочешь, сообщу если освободится место?",
-                reply_markup=kb
-            )
-            return
 
         username = callback.from_user.username
         if username:
@@ -563,6 +600,26 @@ async def callbacks(callback: types.CallbackQuery):
         else:
             username = callback.from_user.full_name
 
+        if count >= slots:
+            # Если мест нет, проверяем очередь
+            cursor.execute(
+                "SELECT * FROM waitlist WHERE user_id=? AND training_id=?",
+                (user_id, t_id)
+            )
+            if cursor.fetchone():
+                await callback.message.answer("Ты уже в списке ожидания ⏳")
+                return
+
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⏳ Встать в очередь", callback_data=f"wait_{t_id}")]
+            ])
+            await callback.message.answer(
+                "Мест нет 😢\n\nХочешь, сообщу если освободится место?",
+                reply_markup=kb
+            )
+            return
+
+        # Записываем пользователя
         cursor.execute(
             "INSERT INTO bookings VALUES (?, ?, ?)",
             (user_id, username, t_id)
@@ -570,9 +627,8 @@ async def callbacks(callback: types.CallbackQuery):
         conn.commit()
 
         await callback.message.answer("✅ Ты записана на тренировку! 💪")
-
         await callback.message.answer(
-    """Реквизиты для оплаты через мобильное приложение:
+            """Реквизиты для оплаты через мобильное приложение:
 
 ИП Кротенко Татьяна Александровна  
 Адрес: Республика Беларусь, Гомельская обл., Чечерский р-н, Оторский сельсовет, п. Ковалёв Рог, ул. Крестьянская, д. 14  
@@ -590,7 +646,17 @@ async def callbacks(callback: types.CallbackQuery):
 После оплаты, пожалуйста, направляйте чек в личные сообщения @krotanny 📩  
 
 Заранее благодарю! 🌺"""
-)
+        )
+
+        # 🔔 уведомление админу, если после этой записи тренировка стала полной
+        if count + 1 >= slots:
+            try:
+                await bot.send_message(
+                    ADMIN_ID,
+                    f"⚠️ Тренировка заполнена!\n\n{name} {date} {time}"
+                )
+            except Exception as e:
+                print("Ошибка отправки админу:", e)
 
     # ===== ОТМЕНА =====
     elif data.startswith("cancel_"):
@@ -620,6 +686,7 @@ async def callbacks(callback: types.CallbackQuery):
             except:
                 pass
 
+        # Очистка очереди после уведомления
         cursor.execute(
             "DELETE FROM waitlist WHERE training_id=?",
             (t_id,)
@@ -632,10 +699,8 @@ async def callbacks(callback: types.CallbackQuery):
             return
 
         t_id = int(data.split("_")[1])
-
         cursor.execute("SELECT * FROM trainings WHERE id=?", (t_id,))
         t = cursor.fetchone()
-
         if not t:
             return
 
@@ -651,9 +716,9 @@ async def callbacks(callback: types.CallbackQuery):
         for u in users:
             try:
                 await bot.send_message(
-    u[0],
-    f"❌ Тренировка отменена\n\n{name} {short_date} {time}\n\nИзвини 🙏"
-)
+                    u[0],
+                    f"❌ Тренировка отменена\n\n{name} {short_date} {time}\n\nИзвини 🙏"
+                )
             except:
                 pass
 
@@ -664,6 +729,26 @@ async def callbacks(callback: types.CallbackQuery):
         conn.commit()
 
         await callback.message.answer("Удалено 🗑")
+
+    # ===== ОЧЕРЕДЬ =====
+    elif data.startswith("wait_"):
+        t_id = int(data.split("_")[1])
+
+        cursor.execute(
+            "SELECT * FROM waitlist WHERE user_id=? AND training_id=?",
+            (user_id, t_id)
+        )
+        if cursor.fetchone():
+            await callback.message.answer("Ты уже в списке ожидания ⏳")
+            return
+
+        cursor.execute(
+            "INSERT INTO waitlist VALUES (?, ?)",
+            (user_id, t_id)
+        )
+        conn.commit()
+
+        await callback.message.answer("Ты добавлена в список ожидания ⏳")
 # ===== ЗАПУСК =====
 async def main():
     print("Бот запущен 🚀")
@@ -674,3 +759,5 @@ async def main():
     asyncio.create_task(cleanup_loop())  # 👈 ВОТ СЮДА
 
     await dp.start_polling(bot)
+
+asyncio.run(main())
