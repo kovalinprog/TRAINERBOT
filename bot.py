@@ -350,41 +350,40 @@ async def handle(message: types.Message, state: FSMContext):
     elif message.text == "⬅️ Назад":
         await message.answer("Меню 👇", reply_markup=get_main_kb(message.from_user.id))
 
-    # ===== ДОБАВИТЬ ЗАМЕРЫ =====
     elif message.text == "📏 Добавить замеры":
         await message.answer("Введите дату замеров (дд.мм), без года:")
         await state.set_state(AddMeasurement.date)
 
-   # ===== ОТЧЕТ ВЕСА ДЛЯ АДМИНА =====
-elif message.text == "📈 Отчет веса" and message.from_user.id == ADMIN_ID:
-    cursor.execute("SELECT DISTINCT user_id, username FROM measurements")
-    users = cursor.fetchall()
+    # ===== ОТЧЕТ ВЕСА ДЛЯ АДМИНА =====
+    elif message.text == "📈 Отчет веса" and message.from_user.id == ADMIN_ID:
+        cursor.execute("SELECT DISTINCT user_id, username FROM measurements")
+        users = cursor.fetchall()
 
-    if not users:
-        await message.answer("Нет данных о замерах")
-        return
+        if not users:
+            await message.answer("Нет данных о замерах")
+            return
 
-    text = ""
-    for user_id, username in users:
-        cursor.execute(
-            "SELECT date, weight FROM measurements WHERE user_id=? ORDER BY rowid",
-            (user_id,)
-        )
-        records = cursor.fetchall()
-        if not records:
-            continue
+        text = ""
+        for user_id, username in users:
+            cursor.execute(
+                "SELECT date, weight FROM measurements WHERE user_id=? ORDER BY rowid",
+                (user_id,)
+            )
+            records = cursor.fetchall()
+            if not records:
+                continue
 
-        first_weight = records[0][1]
-        last_weight = records[-1][1]
-        diff = last_weight - first_weight
+            first_weight = records[0][1]
+            last_weight = records[-1][1]
+            diff = last_weight - first_weight
 
-        # Ссылка на профиль участника
-        text += f"\n<a href='tg://user?id={user_id}'>{username}</a>:\n"
-        for date, weight in records:
-            text += f"  {date} — {weight} кг\n"
-        text += f"  Разница: {diff:+.1f} кг\n"
+            # Ссылка на профиль участника
+            text += f"\n<a href='tg://user?id={user_id}'>{username}</a>:\n"
+            for date, weight in records:
+                text += f"  {date} — {weight} кг\n"
+            text += f"  Разница: {diff:+.1f} кг\n"
 
-    await message.answer(text, parse_mode="HTML")
+        await message.answer(text, parse_mode="HTML")
 
     # ===== СПИСОК УЧАСТНИКОВ =====
     elif message.text == "📋 Список участников":
