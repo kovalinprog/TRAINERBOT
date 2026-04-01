@@ -86,9 +86,9 @@ def format_date(date_str):
     dt = datetime.strptime(date_str, "%d.%m.%Y")
     return dt.strftime("%d.%m")
 
-# ===== ОЧИСТКА =====
 def cleanup_trainings():
     now = datetime.now()
+    print(f"Проверка очистки: {now}")
 
     cursor.execute("SELECT * FROM trainings")
     trainings = cursor.fetchall()
@@ -96,30 +96,31 @@ def cleanup_trainings():
     for t in trainings:
         t_id, name, date, time, slots = t
 
-        dt = datetime.strptime(f"{date} {time}", "%d.%m.%Y %H:%M")
+        try:
+            dt = datetime.strptime(f"{date} {time}", "%d.%m.%Y %H:%M")
+        except Exception as e:
+            print(f"Ошибка парсинга даты для тренировки {t_id}: {e}")
+            continue
 
         if dt < now:
+            print(f"Удаляем тренировку: {name} {date} {time}")
             # 🔹 берём всех записанных
-            cursor.execute(
-                "SELECT user_id, username FROM bookings WHERE training_id=?",
-                (t_id,)
-            )
+            cursor.execute("SELECT user_id, username FROM bookings WHERE training_id=?", (t_id,))
             users = cursor.fetchall()
 
-            # 🔹 сохраняем в историю
             for user_id, username in users:
                 cursor.execute(
                     "INSERT INTO history VALUES (?, ?, ?, ?, ?)",
                     (user_id, username, name, date, time)
                 )
 
-            # 🔹 удаляем тренировку
+            # удаляем
             cursor.execute("DELETE FROM trainings WHERE id=?", (t_id,))
             cursor.execute("DELETE FROM bookings WHERE training_id=?", (t_id,))
             cursor.execute("DELETE FROM reminders WHERE training_id=?", (t_id,))
+            cursor.execute("DELETE FROM waitlist WHERE training_id=?", (t_id,))
 
     conn.commit()
-
 # ===== МЕНЮ =====
 def get_main_kb(user_id):
     if user_id == ADMIN_ID:
@@ -354,35 +355,36 @@ async def handle(message: types.Message, state: FSMContext):
         await message.answer("Введите дату замеров (дд.мм), без года:")
         await state.set_state(AddMeasurement.date)
 
-    # ===== ОТЧЕТ ВЕСА ДЛЯ АДМИНА =====
-    elif message.text == "📈 Отчет веса" and message.from_user.id == ADMIN_ID:
-        cursor.execute("SELECT DISTINCT user_id, username FROM measurements")
-        users = cursor.fetchall()
+   # ===== ОТЧЕТ ВЕСА ДЛЯ АДМИНА =====
+elif message.text == "📈 Отчет веса" and message.from_user.id == ADMIN_ID:
+    cursor.execute("SELECT DISTINCT user_id, username FROM measurements")
+    users = cursor.fetchall()
 
-        if not users:
-            await message.answer("Нет данных о замерах")
-            return
+    if not users:
+        await message.answer("Нет данных о замерах")
+        return
 
-        text = ""
-        for user_id, username in users:
-            cursor.execute(
-                "SELECT date, weight FROM measurements WHERE user_id=? ORDER BY rowid",
-                (user_id,)
-            )
-            records = cursor.fetchall()
-            if not records:
-                continue
+    text = ""
+    for user_id, username in users:
+        cursor.execute(
+            "SELECT date, weight FROM measurements WHERE user_id=? ORDER BY rowid",
+            (user_id,)
+        )
+        records = cursor.fetchall()
+        if not records:
+            continue
 
-            first_weight = records[0][1]
-            last_weight = records[-1][1]
-            diff = last_weight - first_weight
+        first_weight = records[0][1]
+        last_weight = records[-1][1]
+        diff = last_weight - first_weight
 
-            text += f"\n<a href='tg://user?id={user_id}'>{username}</a>:\n"
-            for date, weight in records:
-                text += f"  {date} — {weight} кг\n"
-            text += f"  Разница: {diff:+.1f} кг\n"
+        # Ссылка на профиль участника
+        text += f"\n<a href='tg://user?id={user_id}'>{username}</a>:\n"
+        for date, weight in records:
+            text += f"  {date} — {weight} кг\n"
+        text += f"  Разница: {diff:+.1f} кг\n"
 
-        await message.answer(text, parse_mode="HTML")
+    await message.answer(text, parse_mode="HTML")
 
     # ===== СПИСОК УЧАСТНИКОВ =====
     elif message.text == "📋 Список участников":
