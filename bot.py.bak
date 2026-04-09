@@ -1,0 +1,814 @@
+﻿import asyncio
+import sqlite3
+from datetime import datetime
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
+from aiogram.filters import StateFilter
+
+TOKEN = "8626742579:AAFp06-KUYOzJ_e-qGDRyuWn7Gvs-mzpVoQ"
+ADMIN_ID = 76038670
+
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
+
+# ===== Р‘РђР—Рђ =====
+conn = sqlite3.connect("db.sqlite3", check_same_thread=False)
+cursor = conn.cursor()
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS trainings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT,
+    date TEXT,
+    time TEXT,
+    slots INTEGER
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS waitlist (
+    user_id INTEGER,
+    training_id INTEGER
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS bookings (
+    user_id INTEGER,
+    username TEXT,
+    training_id INTEGER
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS reminders (
+    user_id INTEGER,
+    training_id INTEGER
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS history (
+    user_id INTEGER,
+    username TEXT,
+    training_name TEXT,
+    date TEXT,
+    time TEXT
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS measurements (
+    user_id INTEGER,
+    username TEXT,
+    date TEXT,
+    weight REAL
+)
+""")
+
+conn.commit()
+
+# ===== FSM =====
+class AddTraining(StatesGroup):
+    name = State()
+    date = State()
+    time = State()
+    slots = State()
+
+class AddMeasurement(StatesGroup):
+    date = State()
+    weight = State()
+
+# ===== Р”РђРўРђ =====
+def format_date(date_str):
+    dt = datetime.strptime(date_str, "%d.%m.%Y")
+    return dt.strftime("%d.%m")
+
+def cleanup_trainings():
+    now = datetime.now()
+    print(f"РџСЂРѕРІРµСЂРєР° РѕС‡РёСЃС‚РєРё: {now}")
+
+    cursor.execute("SELECT * FROM trainings")
+    trainings = cursor.fetchall()
+
+    for t in trainings:
+        t_id, name, date, time, slots = t
+
+        try:
+            dt = datetime.strptime(f"{date} {time}", "%d.%m.%Y %H:%M")
+        except Exception as e:
+            print(f"РћС€РёР±РєР° РїР°СЂСЃРёРЅРіР° РґР°С‚С‹ РґР»СЏ С‚СЂРµРЅРёСЂРѕРІРєРё {t_id}: {e}")
+            continue
+
+        if dt < now:
+            print(f"РЈРґР°Р»СЏРµРј С‚СЂРµРЅРёСЂРѕРІРєСѓ: {name} {date} {time}")
+            # рџ”№ Р±РµСЂС‘Рј РІСЃРµС… Р·Р°РїРёСЃР°РЅРЅС‹С…
+            cursor.execute("SELECT user_id, username FROM bookings WHERE training_id=?", (t_id,))
+            users = cursor.fetchall()
+
+            for user_id, username in users:
+                cursor.execute(
+                    "INSERT INTO history VALUES (?, ?, ?, ?, ?)",
+                    (user_id, username, name, date, time)
+                )
+
+            # СѓРґР°Р»СЏРµРј
+            cursor.execute("DELETE FROM trainings WHERE id=?", (t_id,))
+            cursor.execute("DELETE FROM bookings WHERE training_id=?", (t_id,))
+            cursor.execute("DELETE FROM reminders WHERE training_id=?", (t_id,))
+            cursor.execute("DELETE FROM waitlist WHERE training_id=?", (t_id,))
+
+    conn.commit()
+# ===== РњР•РќР® =====
+def get_main_kb(user_id):
+    if user_id == ADMIN_ID:
+        return ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="рџ’ЄрџЏ» Р—Р°РїРёСЃР°С‚СЊСЃСЏ")],
+                [KeyboardButton(text="вњ… РњРѕРё Р·Р°РїРёСЃРё")],
+                [KeyboardButton(text="вљ™пёЏ РђРґРјРёРЅРєР°")]
+            ],
+            resize_keyboard=True
+        )
+    else:
+        return ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="рџ’ЄрџЏ» Р—Р°РїРёСЃР°С‚СЊСЃСЏ")],
+                [KeyboardButton(text="вњ… РњРѕРё Р·Р°РїРёСЃРё")],
+                [KeyboardButton(text="рџ“Џ Р”РѕР±Р°РІРёС‚СЊ Р·Р°РјРµСЂС‹")]  # в†ђ РґР»СЏ РєР»РёРµРЅС‚Р°
+            ],
+            resize_keyboard=True
+        )
+
+def get_admin_kb():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="вћ• Р”РѕР±Р°РІРёС‚СЊ С‚СЂРµРЅРёСЂРѕРІРєСѓ")],
+            [KeyboardButton(text="рџ—‘пёЏ РЈРґР°Р»РёС‚СЊ С‚СЂРµРЅРёСЂРѕРІРєСѓ")],
+            [KeyboardButton(text="рџ“‹ РЎРїРёСЃРѕРє СѓС‡Р°СЃС‚РЅРёРєРѕРІ")],
+            [KeyboardButton(text="рџ“Љ РџРѕСЃРµС‰РµРЅРёСЏ")],
+            [KeyboardButton(text="рџ“€ РћС‚С‡РµС‚ РІРµСЃР°")],  # в†ђ РґР»СЏ Р°РґРјРёРЅР°
+            [KeyboardButton(text="в¬…пёЏ РќР°Р·Р°Рґ")]
+        ],
+        resize_keyboard=True
+    )
+
+def get_measurement_cancel_kb():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="в¬…пёЏ РќР°Р·Р°Рґ")]
+        ],
+        resize_keyboard=True
+    )
+
+def get_clear_list_kb(action):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="рџ—‘пёЏ РћС‡РёСЃС‚РёС‚СЊ", callback_data=action)]
+        ]
+    )
+
+# ===== РЎРџРРЎРћРљ РўР Р•РќРР РћР’РћРљ =====
+def get_trainings_kb():
+    kb = InlineKeyboardMarkup(inline_keyboard=[])
+
+    cursor.execute("SELECT * FROM trainings")
+    rows = cursor.fetchall()
+
+    for t_id, name, date, time, slots in rows:
+        try:
+            dt = datetime.strptime(f"{date} {time}", "%d.%m.%Y %H:%M")
+        except:
+            continue
+
+        if dt < datetime.now():
+            continue
+
+        cursor.execute("SELECT COUNT(*) FROM bookings WHERE training_id=?", (t_id,))
+        count = cursor.fetchone()[0]
+
+        free = slots - count
+        short_date = format_date(date)
+
+        name_short = name[:15] + "..." if len(name) > 15 else name
+        text = f"{name_short} {short_date} {time} ({free})"
+
+        kb.inline_keyboard.append([
+            InlineKeyboardButton(text=text, callback_data=f"book_{t_id}")
+        ])
+
+    if not kb.inline_keyboard:
+        kb.inline_keyboard.append([
+            InlineKeyboardButton(text="РќРµС‚ С‚СЂРµРЅРёСЂРѕРІРѕРє рџў", callback_data="empty")
+        ])
+
+    return kb
+
+# ===== РЈР”РђР›Р•РќРР• =====
+def get_delete_kb():
+    kb = InlineKeyboardMarkup(inline_keyboard=[])
+
+    cursor.execute("SELECT * FROM trainings")
+    rows = cursor.fetchall()
+
+    for t_id, name, date, time, _ in rows:
+        short_date = format_date(date)
+
+        kb.inline_keyboard.append([
+            InlineKeyboardButton(
+                text=f"вќЊ {name} {short_date} {time}",
+                callback_data=f"delete_{t_id}"
+            )
+        ])
+
+    return kb
+
+# ===== РќРђРџРћРњРРќРђРќРРЇ =====
+async def reminder_loop():
+    while True:
+        now = datetime.now()
+
+        cursor.execute("SELECT * FROM trainings")
+        trainings_list = cursor.fetchall()
+
+        for t_id, name, date, time, _ in trainings_list:
+            try:
+                training_dt = datetime.strptime(f"{date} {time}", "%d.%m.%Y %H:%M")
+            except:
+                continue
+
+            diff = training_dt - now
+
+            if 86340 <= diff.total_seconds() <= 86460:
+
+                cursor.execute(
+                    "SELECT user_id FROM bookings WHERE training_id=?",
+                    (t_id,)
+                )
+                users = cursor.fetchall()
+
+                short_date = format_date(date)
+
+                for (user_id,) in users:
+
+                    cursor.execute(
+                        "SELECT * FROM reminders WHERE user_id=? AND training_id=?",
+                        (user_id, t_id)
+                    )
+                    if cursor.fetchone():
+                        continue
+
+                    try:
+                        await bot.send_message(
+                            user_id,
+                            f"вЏ° РќР°РїРѕРјРёРЅР°РЅРёРµ!\n\n"
+                            f"Р—Р°РІС‚СЂР° С‚СЂРµРЅРёСЂРѕРІРєР° рџ’Є\n\n"
+                            f"{name} {short_date} {time}\n\n"
+                            f"Р–РґСѓ РЅР°С€Сѓ С‚СЂРµРЅРёСЂРѕРІРєСѓ! РќР°РїРѕРјРёРЅР°СЋ, С‡С‚РѕР±С‹ С‚С‹ С‚РѕС‡РЅРѕ РЅРµ РїСЂРѕРїСѓСЃС‚РёР»Р° вќ¤пёЏ"
+                        )
+
+                        cursor.execute(
+                            "INSERT INTO reminders VALUES (?, ?)",
+                            (user_id, t_id)
+                        )
+                        conn.commit()
+
+                    except:
+                        pass
+
+        await asyncio.sleep(60)
+
+# ===== РђР’РўРћРћР§РРЎРўРљРђ =====
+async def cleanup_loop():
+    while True:
+        print(f"РџСЂРѕРІРµСЂРєР° РѕС‡РёСЃС‚РєРё: {datetime.now()}")
+        cleanup_trainings()
+        await asyncio.sleep(300)  # РєР°Р¶РґС‹Рµ 5 РјРёРЅСѓС‚
+
+# ===== РћРЎРќРћР’Рђ =====
+@dp.message(StateFilter(None))
+async def handle(message: types.Message, state: FSMContext):
+
+    cleanup_trainings()
+
+    if message.text == "/start":
+        await message.answer(
+            """Р—РґСЂР°РІСЃС‚РІСѓР№С‚Рµ! рџ‘‹
+Р Р°РґС‹ РїСЂРёРІРµС‚СЃС‚РІРѕРІР°С‚СЊ Р’Р°СЃ РІ Р¶РµРЅСЃРєРѕРј С„РёС‚РЅРµСЃ-РїСЂРѕСЃС‚СЂР°РЅСЃС‚РІРµ рџ’«
+
+рџ“Њ Р¤РѕСЂРјР°С‚С‹ С‚СЂРµРЅРёСЂРѕРІРѕРє:
+вЂў Р¤СѓРЅРєС†РёРѕРЅР°Р»СЊРЅРѕ-СЃРёР»РѕРІС‹Рµ (РєСЂСѓРіРѕРІС‹Рµ)
+вЏ±пёЏ Р”Р»РёС‚РµР»СЊРЅРѕСЃС‚СЊ: 55 РјРёРЅСѓС‚
+рџ‘ЇвЂЌв™ЂпёЏ РўРѕР»СЊРєРѕ РґР»СЏ РґРµРІСѓС€РµРє
+рџЋЇ РџРѕРґС…РѕРґРёС‚ РґР»СЏ Р»СЋР±РѕРіРѕ РІРѕР·СЂР°СЃС‚Р° Рё СѓСЂРѕРІРЅСЏ РїРѕРґРіРѕС‚РѕРІРєРё
+рџ’і РЎС‚РѕРёРјРѕСЃС‚СЊ: 15,00 СЂСѓР±Р»РµР№
+
+вЂў РРЅРґРёРІРёРґСѓР°Р»СЊРЅС‹Рµ С‚СЂРµРЅРёСЂРѕРІРєРё РІ С‚СЂРµРЅР°Р¶РµСЂРЅРѕРј Р·Р°Р»Рµ
+рџ“Љ РџСЂРѕРіСЂР°РјРјР° СЃРѕСЃС‚Р°РІР»СЏРµС‚СЃСЏ РїРѕСЃР»Рµ С„РёС‚РЅРµСЃ-С‚РµСЃС‚РёСЂРѕРІР°РЅРёСЏ
+рџ’і РЎС‚РѕРёРјРѕСЃС‚СЊ Рё РїРѕРґСЂРѕР±РЅРѕСЃС‚Рё вЂ” РїРѕСЃР»Рµ РґРёР°РіРЅРѕСЃС‚РёРєРё
+
+РќР° Р·Р°РЅСЏС‚РёСЏС… Р’С‹ Р±СѓРґРµС‚Рµ СѓРєСЂРµРїР»СЏС‚СЊ РјС‹С€С†С‹, СѓР»СѓС‡С€Р°С‚СЊ РІС‹РЅРѕСЃР»РёРІРѕСЃС‚СЊ Рё С‡СѓРІСЃС‚РІРѕРІР°С‚СЊ Р±РѕР»СЊС€Рµ СЌРЅРµСЂРіРёРё РєР°Р¶РґС‹Р№ РґРµРЅСЊ вљЎпёЏ
+
+РҐРѕС‚РёС‚Рµ Р·Р°РїРёСЃР°С‚СЊСЃСЏ РЅР° Р±Р»РёР¶Р°Р№С€СѓСЋ С‚СЂРµРЅРёСЂРѕРІРєСѓ РёР»Рё РїСЂРѕР№С‚Рё С„РёС‚РЅРµСЃ-С‚РµСЃС‚РёСЂРѕРІР°РЅРёРµ?  
+Р’С‹Р±РёСЂР°Р№ РґРµР№СЃС‚РІРёРµ РЅРёР¶Рµ рџ‘‡""",
+            reply_markup=get_main_kb(message.from_user.id)
+        )
+
+    elif message.text == "рџ’ЄрџЏ» Р—Р°РїРёСЃР°С‚СЊСЃСЏ":
+        kb = get_trainings_kb()
+
+        if kb.inline_keyboard[0][0].text == "РќРµС‚ С‚СЂРµРЅРёСЂРѕРІРѕРє рџў":
+            await message.answer("Р Р°СЃРїРёСЃР°РЅРёРµ С‚СЂРµРЅРёСЂРѕРІРѕРє РїРѕРєР° РЅРµ СЃС„РѕСЂРјРёСЂРѕРІР°РЅРѕ.")
+            return
+
+        await message.answer("Р’С‹Р±РµСЂРё С‚СЂРµРЅРёСЂРѕРІРєСѓ:", reply_markup=kb)
+
+    elif message.text == "вњ… РњРѕРё Р·Р°РїРёСЃРё":
+        cursor.execute(
+            "SELECT training_id FROM bookings WHERE user_id=?",
+            (message.from_user.id,)
+        )
+        rows = cursor.fetchall()
+
+        if not rows:
+            await message.answer("РЈ С‚РµР±СЏ РЅРµС‚ Р·Р°РїРёСЃРµР№")
+            return
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[])
+
+        for (t_id,) in rows:
+            cursor.execute("SELECT * FROM trainings WHERE id=?", (t_id,))
+            t = cursor.fetchone()
+
+            if not t:
+                continue
+
+            _, name, date, time, _ = t
+            short_date = format_date(date)
+
+            kb.inline_keyboard.append([
+                InlineKeyboardButton(
+                    text=f"вќЊ РћС‚РјРµРЅРёС‚СЊ {name} {short_date} {time}",
+                    callback_data=f"cancel_{t_id}"
+                )
+            ])
+
+        await message.answer("РўРІРѕРё Р·Р°РїРёСЃРё:", reply_markup=kb)
+
+    elif message.text == "вљ™пёЏ РђРґРјРёРЅРєР°":
+        if message.from_user.id != ADMIN_ID:
+            return
+        await message.answer("РђРґРјРёРЅРєР°", reply_markup=get_admin_kb())
+
+    elif message.text == "в¬…пёЏ РќР°Р·Р°Рґ":
+        await message.answer("РњРµРЅСЋ рџ‘‡", reply_markup=get_main_kb(message.from_user.id))
+
+    elif message.text == "рџ“Џ Р”РѕР±Р°РІРёС‚СЊ Р·Р°РјРµСЂС‹":
+        await message.answer(
+            "Р’РІРµРґРёС‚Рµ РґР°С‚Сѓ Р·Р°РјРµСЂРѕРІ (РґРґ.РјРј), Р±РµР· РіРѕРґР°:",
+            reply_markup=get_measurement_cancel_kb()
+        )
+        await state.set_state(AddMeasurement.date)
+
+    # ===== РћРўР§Р•Рў Р’Р•РЎРђ Р”Р›РЇ РђР”РњРРќРђ =====
+    elif message.text == "рџ“€ РћС‚С‡РµС‚ РІРµСЃР°" and message.from_user.id == ADMIN_ID:
+        cursor.execute("SELECT DISTINCT user_id, username FROM measurements")
+        users = cursor.fetchall()
+
+        if not users:
+            await message.answer("РќРµС‚ РґР°РЅРЅС‹С… Рѕ Р·Р°РјРµСЂР°С…")
+            return
+
+        text = ""
+        for user_id, username in users:
+            cursor.execute(
+                "SELECT date, weight FROM measurements WHERE user_id=? ORDER BY rowid",
+                (user_id,)
+            )
+            records = cursor.fetchall()
+            if not records:
+                continue
+
+            first_weight = records[0][1]
+            last_weight = records[-1][1]
+            diff = last_weight - first_weight
+
+            # РЎСЃС‹Р»РєР° РЅР° РїСЂРѕС„РёР»СЊ СѓС‡Р°СЃС‚РЅРёРєР°
+            text += f"\n<a href='tg://user?id={user_id}'>{username}</a>:\n"
+            for date, weight in records:
+                text += f"  {date} вЂ” {weight} РєРі\n"
+            text += f"  Р Р°Р·РЅРёС†Р°: {diff:+.1f} РєРі\n"
+
+        await message.answer(
+            text,
+            parse_mode="HTML",
+            reply_markup=get_clear_list_kb("clear_measurements")
+        )
+
+    # ===== РЎРџРРЎРћРљ РЈР§РђРЎРўРќРРљРћР’ =====
+    elif message.text == "рџ“‹ РЎРїРёСЃРѕРє СѓС‡Р°СЃС‚РЅРёРєРѕРІ":
+        if message.from_user.id != ADMIN_ID:
+            return
+
+        text = ""
+
+        cursor.execute("SELECT * FROM trainings")
+        trainings = cursor.fetchall()
+
+        for t_id, name, date, time, _ in trainings:
+            cursor.execute(
+                "SELECT user_id, username FROM bookings WHERE training_id=?",
+                (t_id,)
+            )
+            users = cursor.fetchall()
+
+            short_date = format_date(date)
+            text += f"\nрџ“Њ {name} {short_date} {time}:\n"
+
+            if not users:
+                text += "  РЅРёРєС‚Рѕ РЅРµ Р·Р°РїРёСЃР°РЅ\n"
+            else:
+                for u in users:
+                    text += f'  - <a href="tg://user?id={u[0]}">{u[1]}</a>\n'
+
+        await message.answer(text or "РџСѓСЃС‚Рѕ", parse_mode="HTML")
+
+    # ===== РџРћРЎР•Р©Р•РќРРЇ =====
+    elif message.text == "рџ“Љ РџРѕСЃРµС‰РµРЅРёСЏ":
+        if message.from_user.id != ADMIN_ID:
+            return
+
+        cursor.execute("""
+            SELECT username, COUNT(*) as visits
+            FROM history
+            GROUP BY user_id
+            ORDER BY visits DESC
+        """)
+        rows = cursor.fetchall()
+
+        if not rows:
+            await message.answer("РќРµС‚ РґР°РЅРЅС‹С…")
+            return
+
+        text = "рџ“Љ РџРѕСЃРµС‰РµРЅРёСЏ:\n\n"
+
+        for username, visits in rows:
+            if visits == 1:
+                word = "СЂР°Р·"
+            elif 2 <= visits <= 4:
+                word = "СЂР°Р·Р°"
+            else:
+                word = "СЂР°Р·"
+
+            text += f"{username} вЂ” {visits} {word}\n"
+
+        await message.answer(text, reply_markup=get_clear_list_kb("clear_history"))
+
+    # ===== Р”РћР‘РђР’РРўР¬ РўР Р•РќРР РћР’РљРЈ =====
+    elif message.text == "вћ• Р”РѕР±Р°РІРёС‚СЊ С‚СЂРµРЅРёСЂРѕРІРєСѓ":
+        if message.from_user.id != ADMIN_ID:
+            return
+
+        await message.answer("Р’РІРµРґРёС‚Рµ РЅР°Р·РІР°РЅРёРµ:")
+        await state.set_state(AddTraining.name)
+
+    # ===== РЈР”РђР›РРўР¬ =====
+    elif message.text == "рџ—‘пёЏ РЈРґР°Р»РёС‚СЊ С‚СЂРµРЅРёСЂРѕРІРєСѓ":
+        if message.from_user.id != ADMIN_ID:
+            return
+
+        kb = get_delete_kb()
+
+        if not kb.inline_keyboard:
+            await message.answer("РќРµС‚ С‚СЂРµРЅРёСЂРѕРІРѕРє")
+            return
+
+        await message.answer("Р’С‹Р±РµСЂРё:", reply_markup=kb)
+# ===== FSM =====
+@dp.message(AddTraining.name)
+async def add_name(message: types.Message, state: FSMContext):
+    await state.update_data(name=message.text)
+    await message.answer("Р’РІРµРґРёС‚Рµ РґР°С‚Сѓ (РґРґ.РјРј.РіРіРіРі):")
+    await state.set_state(AddTraining.date)
+
+@dp.message(AddTraining.date)
+async def add_date(message: types.Message, state: FSMContext):
+
+    user_input = message.text.strip()
+
+    try:
+        parsed_date = datetime.strptime(user_input, "%d.%m.%Y")
+
+        today = datetime.now().date()
+        if parsed_date.date() < today:
+            await message.answer("вќЊ РќРµР»СЊР·СЏ РІС‹Р±СЂР°С‚СЊ РїСЂРѕС€РµРґС€СѓСЋ РґР°С‚Сѓ")
+            return
+
+        clean_date = parsed_date.strftime("%d.%m.%Y")
+
+    except:
+        await message.answer(
+            "вќЊ РќРµРІРµСЂРЅС‹Р№ С„РѕСЂРјР°С‚ РґР°С‚С‹!\n\nР’РІРµРґРё С‚Р°Рє: 25.12.2026"
+        )
+        return
+
+    await state.update_data(date=clean_date)
+    await message.answer("Р’РІРµРґРёС‚Рµ РІСЂРµРјСЏ (РЅР°РїСЂРёРјРµСЂ 18:30):")
+    await state.set_state(AddTraining.time)
+
+@dp.message(AddTraining.time)
+async def add_time(message: types.Message, state: FSMContext):
+
+    user_input = message.text.strip()
+
+    try:
+        parsed_time = datetime.strptime(user_input, "%H:%M")
+        clean_time = parsed_time.strftime("%H:%M")
+    except:
+        await message.answer(
+            "вќЊ РќРµРІРµСЂРЅС‹Р№ С„РѕСЂРјР°С‚ РІСЂРµРјРµРЅРё!\n\nР’РІРµРґРё С‚Р°Рє: 18:30"
+        )
+        return
+
+    await state.update_data(time=clean_time)
+    await message.answer("Р’РІРµРґРёС‚Рµ РєРѕР»РёС‡РµСЃС‚РІРѕ РјРµСЃС‚:")
+    await state.set_state(AddTraining.slots)
+
+@dp.message(AddTraining.slots)
+async def add_slots(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+
+    cursor.execute(
+        "INSERT INTO trainings (name, date, time, slots) VALUES (?, ?, ?, ?)",
+        (data["name"], data["date"], data["time"], int(message.text))
+    )
+    conn.commit()
+
+    await message.answer("РўСЂРµРЅРёСЂРѕРІРєР° РґРѕР±Р°РІР»РµРЅР° вњ…", reply_markup=get_admin_kb())
+    await state.clear()
+
+# ===== FSM РҐР•РќР”Р›Р•Р Р« Р”Р›РЇ Р—РђРњР•Р РћР’ =====
+@dp.message(AddMeasurement.date)
+async def add_measurement_date(message: types.Message, state: FSMContext):
+    if message.text == "в¬…пёЏ РќР°Р·Р°Рґ":
+        await state.clear()
+        await message.answer("РњРµРЅСЋ рџ‘‡", reply_markup=get_main_kb(message.from_user.id))
+        return
+
+    user_input = message.text.strip()
+    try:
+        datetime.strptime(user_input, "%d.%m")
+        await state.update_data(date=user_input)
+        await message.answer(
+            "Р’РІРµРґРёС‚Рµ РІРµСЃ (РєРі), РјРѕР¶РЅРѕ С‡РµСЂРµР· С‚РѕС‡РєСѓ РёР»Рё Р·Р°РїСЏС‚СѓСЋ:",
+            reply_markup=get_measurement_cancel_kb()
+        )
+        await state.set_state(AddMeasurement.weight)
+    except:
+        await message.answer("вќЊ РќРµРІРµСЂРЅС‹Р№ С„РѕСЂРјР°С‚ РґР°С‚С‹! Р’РІРµРґРёС‚Рµ РґРґ.РјРј, РЅР°РїСЂРёРјРµСЂ 25.03")
+        return
+
+@dp.message(AddMeasurement.weight)
+async def add_measurement_weight(message: types.Message, state: FSMContext):
+    if message.text == "в¬…пёЏ РќР°Р·Р°Рґ":
+        await state.clear()
+        await message.answer("РњРµРЅСЋ рџ‘‡", reply_markup=get_main_kb(message.from_user.id))
+        return
+
+    data = await state.get_data()
+    user_id = message.from_user.id
+    username = message.from_user.username or message.from_user.full_name
+
+    weight_text = message.text.strip().replace(",", ".")
+    try:
+        weight = float(weight_text)
+    except:
+        await message.answer("вќЊ РќРµРІРµСЂРЅС‹Р№ С„РѕСЂРјР°С‚ РІРµСЃР°! Р’РІРµРґРёС‚Рµ С‡РёСЃР»Рѕ С‡РµСЂРµР· С‚РѕС‡РєСѓ РёР»Рё Р·Р°РїСЏС‚СѓСЋ.")
+        return
+
+    cursor.execute(
+        "INSERT INTO measurements VALUES (?, ?, ?, ?)",
+        (user_id, username, data["date"], weight)
+    )
+    conn.commit()
+
+    await message.answer(f"📏 Замер добавлен: {data['date']} — {weight} кг", reply_markup=get_main_kb(message.from_user.id))
+    await state.clear()
+
+@dp.callback_query(lambda c: c.data.startswith(("book_", "cancel_", "delete_", "wait_", "clear_")))
+async def callbacks(callback: types.CallbackQuery):
+    cleanup_trainings()
+    await callback.answer()
+
+    user_id = callback.from_user.id
+    data = callback.data
+
+    # ===== Р—РђРџРРЎР¬ РќРђ РўР Р•РќРР РћР’РљРЈ =====
+    if data.startswith("book_"):
+        t_id = int(data.split("_")[1])
+
+        cursor.execute("SELECT * FROM trainings WHERE id=?", (t_id,))
+        t = cursor.fetchone()
+        if not t:
+            await callback.message.answer("РќРµ РЅР°Р№РґРµРЅР° вќЊ")
+            return
+
+        _, name, date, time, slots = t
+
+        # РџСЂРѕРІРµСЂСЏРµРј, РЅРµ Р·Р°РїРёСЃР°РЅ Р»Рё СѓР¶Рµ РїРѕР»СЊР·РѕРІР°С‚РµР»СЊ
+        cursor.execute(
+            "SELECT * FROM bookings WHERE user_id=? AND training_id=?",
+            (user_id, t_id)
+        )
+        if cursor.fetchone():
+            await callback.message.answer("РўС‹ СѓР¶Рµ Р·Р°РїРёСЃР°РЅ")
+            return
+
+        # РЈР·РЅР°С‘Рј С‚РµРєСѓС‰РµРµ РєРѕР»РёС‡РµСЃС‚РІРѕ Р·Р°РїРёСЃРµР№
+        cursor.execute("SELECT COUNT(*) FROM bookings WHERE training_id=?", (t_id,))
+        count = cursor.fetchone()[0]
+
+        username = callback.from_user.username
+        if username:
+            username = "@" + username
+        else:
+            username = callback.from_user.full_name
+
+        if count >= slots:
+            # Р•СЃР»Рё РјРµСЃС‚ РЅРµС‚, РїСЂРѕРІРµСЂСЏРµРј РѕС‡РµСЂРµРґСЊ
+            cursor.execute(
+                "SELECT * FROM waitlist WHERE user_id=? AND training_id=?",
+                (user_id, t_id)
+            )
+            if cursor.fetchone():
+                await callback.message.answer("РўС‹ СѓР¶Рµ РІ СЃРїРёСЃРєРµ РѕР¶РёРґР°РЅРёСЏ вЏі")
+                return
+
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="вЏі Р’СЃС‚Р°С‚СЊ РІ РѕС‡РµСЂРµРґСЊ", callback_data=f"wait_{t_id}")]
+            ])
+            await callback.message.answer(
+                "РњРµСЃС‚ РЅРµС‚ рџў\n\nРҐРѕС‡РµС€СЊ, СЃРѕРѕР±С‰Сѓ РµСЃР»Рё РѕСЃРІРѕР±РѕРґРёС‚СЃСЏ РјРµСЃС‚Рѕ?",
+                reply_markup=kb
+            )
+            return
+
+        # Р—Р°РїРёСЃС‹РІР°РµРј РїРѕР»СЊР·РѕРІР°С‚РµР»СЏ
+        cursor.execute(
+            "INSERT INTO bookings VALUES (?, ?, ?)",
+            (user_id, username, t_id)
+        )
+        conn.commit()
+
+        await callback.message.answer("вњ… РўС‹ Р·Р°РїРёСЃР°РЅР° РЅР° С‚СЂРµРЅРёСЂРѕРІРєСѓ! рџ’Є")
+        await callback.message.answer(
+            """Р РµРєРІРёР·РёС‚С‹ РґР»СЏ РѕРїР»Р°С‚С‹ С‡РµСЂРµР· РјРѕР±РёР»СЊРЅРѕРµ РїСЂРёР»РѕР¶РµРЅРёРµ:
+
+РРџ РљСЂРѕС‚РµРЅРєРѕ РўР°С‚СЊСЏРЅР° РђР»РµРєСЃР°РЅРґСЂРѕРІРЅР°  
+РђРґСЂРµСЃ: Р РµСЃРїСѓР±Р»РёРєР° Р‘РµР»Р°СЂСѓСЃСЊ, Р“РѕРјРµР»СЊСЃРєР°СЏ РѕР±Р»., Р§РµС‡РµСЂСЃРєРёР№ СЂ-РЅ, РћС‚РѕСЂСЃРєРёР№ СЃРµР»СЊСЃРѕРІРµС‚, Рї. РљРѕРІР°Р»С‘РІ Р РѕРі, СѓР». РљСЂРµСЃС‚СЊСЏРЅСЃРєР°СЏ, Рґ. 14  
+РЈРќРџ: 490849533  
+Р Р°СЃС‡С‘С‚РЅС‹Р№ СЃС‡С‘С‚: BY65ALFA30132G71620010270000  
+РІ Р—РђРћ В«РђР»СЊС„Р°-Р‘Р°РЅРєВ», Р‘РРљ: ALFABY2X  
+
+РќР°Р·РЅР°С‡РµРЅРёРµ РїР»Р°С‚РµР¶Р°:  
+В«РћРїР»Р°С‚Р° Р·Р° РѕРєР°Р·Р°РЅРёРµ СѓСЃР»СѓРі РїРѕ Р”РѕРіРѕРІРѕСЂСѓ РѕС‚ 01.03.2026 Рі.  
+Р’Р°С€Рё Р¤РРћ (РѕР±СЏР·Р°С‚РµР»СЊРЅРѕ!)В»
+
+РћРїР»Р°С‚Сѓ РїСЂРѕС€Сѓ РІРЅРѕСЃРёС‚СЊ РµР¶РµРјРµСЃСЏС‡РЅРѕ вЂ” РЅРµ РїРѕР·РґРЅРµРµ РїРѕСЃР»РµРґРЅРµРіРѕ СЂР°Р±РѕС‡РµРіРѕ РґРЅСЏ РјРµСЃСЏС†Р°  
+(СЃС‚РѕРёРјРѕСЃС‚СЊ РѕРґРЅРѕР№ С‚СЂРµРЅРёСЂРѕРІРєРё вЂ” 15 СЂСѓР±Р»РµР№)
+
+РџРѕСЃР»Рµ РѕРїР»Р°С‚С‹, РїРѕР¶Р°Р»СѓР№СЃС‚Р°, РЅР°РїСЂР°РІР»СЏР№С‚Рµ С‡РµРє РІ Р»РёС‡РЅС‹Рµ СЃРѕРѕР±С‰РµРЅРёСЏ @krotanny рџ“©  
+
+Р—Р°СЂР°РЅРµРµ Р±Р»Р°РіРѕРґР°СЂСЋ! рџЊє"""
+        )
+
+        # рџ”” СѓРІРµРґРѕРјР»РµРЅРёРµ Р°РґРјРёРЅСѓ, РµСЃР»Рё РїРѕСЃР»Рµ СЌС‚РѕР№ Р·Р°РїРёСЃРё С‚СЂРµРЅРёСЂРѕРІРєР° СЃС‚Р°Р»Р° РїРѕР»РЅРѕР№
+        if count + 1 >= slots:
+            try:
+                await bot.send_message(
+                    ADMIN_ID,
+                    f"вљ пёЏ Р’СЃРµ РјРµСЃС‚Р° Р·Р°РїРѕР»РЅРµРЅС‹!\n\n{name} {date} {time}"
+                )
+            except Exception as e:
+                print("РћС€РёР±РєР° РѕС‚РїСЂР°РІРєРё Р°РґРјРёРЅСѓ:", e)
+
+    # ===== РћРўРњР•РќРђ =====
+    elif data.startswith("cancel_"):
+        t_id = int(data.split("_")[1])
+
+        cursor.execute(
+            "DELETE FROM bookings WHERE user_id=? AND training_id=?",
+            (user_id, t_id)
+        )
+        conn.commit()
+
+        await callback.message.answer("Р—Р°РїРёСЃСЊ РѕС‚РјРµРЅРµРЅР° вќЊ")
+
+        # рџ”” СѓРІРµРґРѕРјР»РµРЅРёРµ РѕС‡РµСЂРµРґРё
+        cursor.execute(
+            "SELECT user_id FROM waitlist WHERE training_id=?",
+            (t_id,)
+        )
+        wait_users = cursor.fetchall()
+
+        for (u_id,) in wait_users:
+            try:
+                await bot.send_message(
+                    u_id,
+                    "рџ”Ґ РћСЃРІРѕР±РѕРґРёР»РѕСЃСЊ РјРµСЃС‚Рѕ РЅР° С‚СЂРµРЅРёСЂРѕРІРєСѓ!\n\nРЈСЃРїРµР№ Р·Р°РїРёСЃР°С‚СЊСЃСЏ рџ’Є"
+                )
+            except:
+                pass
+
+        # РћС‡РёСЃС‚РєР° РѕС‡РµСЂРµРґРё РїРѕСЃР»Рµ СѓРІРµРґРѕРјР»РµРЅРёСЏ
+        cursor.execute(
+            "DELETE FROM waitlist WHERE training_id=?",
+            (t_id,)
+        )
+        conn.commit()
+
+    # ===== РЈР”РђР›Р•РќРР• =====
+    elif data.startswith("delete_"):
+        if user_id != ADMIN_ID:
+            return
+
+        t_id = int(data.split("_")[1])
+        cursor.execute("SELECT * FROM trainings WHERE id=?", (t_id,))
+        t = cursor.fetchone()
+        if not t:
+            return
+
+        _, name, date, time, _ = t
+        short_date = format_date(date)
+
+        cursor.execute(
+            "SELECT user_id FROM bookings WHERE training_id=?",
+            (t_id,)
+        )
+        users = cursor.fetchall()
+
+        for u in users:
+            try:
+                await bot.send_message(
+                    u[0],
+                    f"вќЊ РўСЂРµРЅРёСЂРѕРІРєР° РѕС‚РјРµРЅРµРЅР°\n\n{name} {short_date} {time}\n\nРР·РІРёРЅРё рџ™Џ"
+                )
+            except:
+                pass
+
+        cursor.execute("DELETE FROM trainings WHERE id=?", (t_id,))
+        cursor.execute("DELETE FROM bookings WHERE training_id=?", (t_id,))
+        cursor.execute("DELETE FROM reminders WHERE training_id=?", (t_id,))
+        cursor.execute("DELETE FROM waitlist WHERE training_id=?", (t_id,))
+        conn.commit()
+
+        await callback.message.answer("РЈРґР°Р»РµРЅРѕ рџ—‘")
+
+    # ===== РћР§Р•Р Р•Р”Р¬ =====
+    elif data.startswith("wait_"):
+        t_id = int(data.split("_")[1])
+
+        cursor.execute(
+            "SELECT * FROM waitlist WHERE user_id=? AND training_id=?",
+            (user_id, t_id)
+        )
+        if cursor.fetchone():
+            await callback.message.answer("РўС‹ СѓР¶Рµ РІ СЃРїРёСЃРєРµ РѕР¶РёРґР°РЅРёСЏ вЏі")
+            return
+
+        cursor.execute(
+            "INSERT INTO waitlist VALUES (?, ?)",
+            (user_id, t_id)
+        )
+        conn.commit()
+
+        await callback.message.answer("РўС‹ РґРѕР±Р°РІР»РµРЅР° РІ СЃРїРёСЃРѕРє РѕР¶РёРґР°РЅРёСЏ вЏі")
+    elif data == "clear_history":
+        if user_id != ADMIN_ID:
+            return
+
+        cursor.execute("DELETE FROM history")
+        conn.commit()
+        await callback.message.answer("РЎРїРёСЃРѕРє РїРѕСЃРµС‰РµРЅРёР№ РѕС‡РёС‰РµРЅ рџ—‘пёЏ")
+
+    elif data == "clear_measurements":
+        if user_id != ADMIN_ID:
+            return
+
+        cursor.execute("DELETE FROM measurements")
+        conn.commit()
+        await callback.message.answer("РЎРїРёСЃРѕРє Р·Р°РјРµСЂРѕРІ РѕС‡РёС‰РµРЅ рџ—‘пёЏ")
+
+async def main():
+    print("Р‘РѕС‚ Р·Р°РїСѓС‰РµРЅ рџљЂ")
+
+    cleanup_trainings()  # рџ‘€ СЃСЂР°Р·Сѓ РїСЂРё СЃС‚Р°СЂС‚Рµ
+
+    asyncio.create_task(reminder_loop())
+    asyncio.create_task(cleanup_loop())  # рџ‘€ Р’РћРў РЎР®Р”Рђ
+
+    await dp.start_polling(bot)
+
+asyncio.run(main())

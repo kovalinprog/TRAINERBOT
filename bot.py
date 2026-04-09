@@ -1,4 +1,5 @@
-import asyncio
+﻿import asyncio
+import os
 import sqlite3
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types
@@ -6,12 +7,26 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMar
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.filters import StateFilter
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 TOKEN = "8626742579:AAFp06-KUYOzJ_e-qGDRyuWn7Gvs-mzpVoQ"
-ADMIN_ID = 76038670
+ADMIN_ID = 932779989
+SPREADSHEET_ID = "16DnKUsc2KZ5foX9jf4RoNU5VBvqqPVM_XPVqnFvyFhU"
+GOOGLE_CREDENTIALS_FILE = "trainerbot-492814-fc3ec93852f5.json"
+GOOGLE_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+VISITS_SHEET_NAME = "Посещения"
+MEASUREMENTS_SHEET_NAME = "Замеры"
+COMPLETED_TRAININGS_SHEET_NAME = "Прошедшие тренировки"
+VISITS_HEADERS = ["Ник", "Посещений"]
+MEASUREMENTS_ROW_LABEL = "вес"
+COMPLETED_TRAININGS_HEADERS = ["Дата", "Время", "Тренировка", "Присутствовали"]
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
+sheets_service = None
+sheets_initialized = False
 
 # ===== БАЗА =====
 conn = sqlite3.connect("db.sqlite3", check_same_thread=False)
@@ -81,6 +96,423 @@ class AddMeasurement(StatesGroup):
     date = State()
     weight = State()
 
+def get_sheets_service():
+    global sheets_service
+
+    if sheets_service is not None:
+        return sheets_service
+
+    credentials_path = os.path.join(os.path.dirname(__file__), GOOGLE_CREDENTIALS_FILE)
+    if not os.path.exists(credentials_path):
+        print(f"Google Sheets credentials not found: {credentials_path}")
+        return None
+
+    try:
+        credentials = Credentials.from_service_account_file(
+            credentials_path,
+            scopes=GOOGLE_SCOPES
+        )
+        sheets_service = build("sheets", "v4", credentials=credentials)
+        return sheets_service
+    except Exception as e:
+        print(f"Google Sheets init error: {e}")
+        return None
+
+def ensure_sheet_exists(service, sheet_name, headers):
+    sheet_range = f"'{sheet_name}'!A1"
+    header_range = f"'{sheet_name}'!A1:Z1"
+
+    spreadsheet = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+    titles = {
+        sheet["properties"]["title"]
+        for sheet in spreadsheet.get("sheets", [])
+    }
+
+    if sheet_name not in titles:
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=SPREADSHEET_ID,
+            body={
+                "requests": [{
+                    "addSheet": {
+                        "properties": {"title": sheet_name}
+                    }
+                }]
+            }
+        ).execute()
+
+    existing = service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=header_range
+    ).execute()
+
+    if headers and not existing.get("values"):
+        service.spreadsheets().values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=sheet_range,
+            valueInputOption="RAW",
+            body={"values": [headers]}
+        ).execute()
+
+def init_google_sheets():
+    global sheets_initialized
+
+    if sheets_initialized:
+        return True
+
+    service = get_sheets_service()
+    if service is None:
+        return False
+
+    try:
+        ensure_sheet_exists(service, VISITS_SHEET_NAME, VISITS_HEADERS)
+        ensure_sheet_exists(service, COMPLETED_TRAININGS_SHEET_NAME, COMPLETED_TRAININGS_HEADERS)
+        ensure_sheet_exists(service, MEASUREMENTS_SHEET_NAME, [])
+        sheets_initialized = True
+        return True
+    except HttpError as e:
+        print(f"Google Sheets setup error: {e}")
+        return False
+    except Exception as e:
+        print(f"Google Sheets unexpected setup error: {e}")
+        return False
+
+def get_column_letter(column_number):
+    result = ""
+    while column_number > 0:
+        column_number, remainder = divmod(column_number - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
+
+def get_column_index(column_letter):
+    index = 0
+    for char in column_letter:
+        index = index * 26 + (ord(char.upper()) - 64)
+    return index
+
+def parse_a1_range_end_column(updated_range):
+    last_part = updated_range.split(":")[-1]
+    letters = "".join(ch for ch in last_part if ch.isalpha())
+    return get_column_index(letters) if letters else 1
+
+def append_google_row(sheet_name, row):
+    if not init_google_sheets():
+        return False
+
+    sheet_range = f"'{sheet_name}'!A1"
+
+    try:
+        get_sheets_service().spreadsheets().values().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range=sheet_range,
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [row]}
+        ).execute()
+        return True
+    except HttpError as e:
+        print(f"Google Sheets append error ({sheet_name}): {e}")
+        return False
+    except Exception as e:
+        print(f"Google Sheets unexpected append error ({sheet_name}): {e}")
+        return False
+
+def upsert_visit_count(username):
+    if not init_google_sheets():
+        return False
+
+    service = get_sheets_service()
+    try:
+        result = service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"'{VISITS_SHEET_NAME}'!A:B"
+        ).execute()
+        values = result.get("values", [])
+
+        if not values:
+            service.spreadsheets().values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"'{VISITS_SHEET_NAME}'!A1:B1",
+                valueInputOption="RAW",
+                body={"values": [VISITS_HEADERS]}
+            ).execute()
+            values = [VISITS_HEADERS]
+        elif values[0][:len(VISITS_HEADERS)] != VISITS_HEADERS:
+            service.spreadsheets().values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"'{VISITS_SHEET_NAME}'!A1:B1",
+                valueInputOption="RAW",
+                body={"values": [VISITS_HEADERS]}
+            ).execute()
+            values[0] = VISITS_HEADERS
+
+        target_row_index = None
+        current_count = 0
+        for index, row in enumerate(values[1:], start=2):
+            if row and row[0] == username:
+                target_row_index = index
+                if len(row) > 1:
+                    try:
+                        current_count = int(float(row[1]))
+                    except:
+                        current_count = 0
+                break
+
+        if target_row_index is None:
+            service.spreadsheets().values().append(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"'{VISITS_SHEET_NAME}'!A1",
+                valueInputOption="USER_ENTERED",
+                insertDataOption="INSERT_ROWS",
+                body={"values": [[username, 1]]}
+            ).execute()
+            return True
+
+        service.spreadsheets().values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"'{VISITS_SHEET_NAME}'!A{target_row_index}:B{target_row_index}",
+            valueInputOption="USER_ENTERED",
+            body={"values": [[username, current_count + 1]]}
+        ).execute()
+        return True
+    except HttpError as e:
+        print(f"Google Sheets visit upsert error: {e}")
+        return False
+    except Exception as e:
+        print(f"Google Sheets unexpected visit upsert error: {e}")
+        return False
+
+def upsert_measurement_row(username, date, weight):
+    if not init_google_sheets():
+        return False
+
+    service = get_sheets_service()
+    try:
+        result = service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"'{MEASUREMENTS_SHEET_NAME}'!A:ZZ"
+        ).execute()
+        values = result.get("values", [])
+
+        target_name_row = None
+        target_weight_row = None
+        next_free_row = 1
+
+        if values:
+            next_free_row = len(values) + 1
+            if next_free_row % 2 == 0:
+                next_free_row += 1
+
+        for index, row in enumerate(values, start=1):
+            if row and row[0] == username:
+                target_name_row = index
+                target_weight_row = index + 1
+                break
+
+        if target_name_row is None:
+            target_name_row = next_free_row
+            target_weight_row = next_free_row + 1
+            service.spreadsheets().values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"'{MEASUREMENTS_SHEET_NAME}'!A{target_name_row}:A{target_weight_row}",
+                valueInputOption="USER_ENTERED",
+                body={"values": [[username], [MEASUREMENTS_ROW_LABEL]]}
+            ).execute()
+            name_row_values = [username]
+            weight_row_values = [MEASUREMENTS_ROW_LABEL]
+        else:
+            name_row_values = values[target_name_row - 1] if len(values) >= target_name_row else [username]
+            weight_row_values = values[target_weight_row - 1] if len(values) >= target_weight_row else [MEASUREMENTS_ROW_LABEL]
+
+        start_column = len(weight_row_values) + 1
+        if start_column < 2:
+            start_column = 2
+
+        date_column = get_column_letter(start_column)
+        weight_column = date_column
+
+        service.spreadsheets().values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"'{MEASUREMENTS_SHEET_NAME}'!{date_column}{target_name_row}:{weight_column}{target_weight_row}",
+            valueInputOption="USER_ENTERED",
+            body={"values": [[date], [weight]]}
+        ).execute()
+
+        updated_name_range = service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"'{MEASUREMENTS_SHEET_NAME}'!A{target_name_row}:ZZ{target_name_row}"
+        ).execute().get("values", [[]])[0]
+        updated_weight_range = service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"'{MEASUREMENTS_SHEET_NAME}'!A{target_weight_row}:ZZ{target_weight_row}"
+        ).execute().get("values", [[]])[0]
+
+        weight_values = []
+        for cell in updated_weight_range[1:]:
+            try:
+                weight_values.append(float(str(cell).replace(",", ".")))
+            except:
+                continue
+
+        if weight_values:
+            diff_text = f"Разница: {weight_values[-1] - weight_values[0]:+.1f} кг"
+            diff_column = get_column_letter(len(updated_weight_range) + 1)
+            service.spreadsheets().values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"'{MEASUREMENTS_SHEET_NAME}'!{diff_column}{target_name_row}",
+                valueInputOption="USER_ENTERED",
+                body={"values": [[diff_text]]}
+            ).execute()
+        return True
+    except HttpError as e:
+        print(f"Google Sheets measurement upsert error: {e}")
+        return False
+    except Exception as e:
+        print(f"Google Sheets unexpected measurement upsert error: {e}")
+        return False
+
+def append_completed_training(date, time, training_name, attendees):
+    attendees_text = ", ".join(attendees) if attendees else "Никто"
+    return append_google_row(
+        COMPLETED_TRAININGS_SHEET_NAME,
+        [date, time, training_name, attendees_text]
+    )
+
+def get_training_display(name, date, time):
+    return f"{name} {format_date(date)} {time}"
+
+def get_active_trainings():
+    cursor.execute("SELECT * FROM trainings")
+    rows = []
+    for training in cursor.fetchall():
+        t_id, name, date, time, slots = training
+        try:
+            dt = datetime.strptime(f"{date} {time}", "%d.%m.%Y %H:%M")
+        except:
+            continue
+        if dt < datetime.now():
+            continue
+        rows.append(training)
+    return rows
+
+def get_manage_bookings_kb():
+    kb = InlineKeyboardMarkup(inline_keyboard=[])
+
+    for t_id, name, date, time, _ in get_active_trainings():
+        cursor.execute("SELECT COUNT(*) FROM bookings WHERE training_id=?", (t_id,))
+        count = cursor.fetchone()[0]
+        if count == 0:
+            continue
+
+        kb.inline_keyboard.append([
+            InlineKeyboardButton(
+                text=f"{get_training_display(name, date, time)} ({count})",
+                callback_data=f"admin_manage_training_{t_id}"
+            )
+        ])
+
+    if not kb.inline_keyboard:
+        kb.inline_keyboard.append([
+            InlineKeyboardButton(text="Нет записей", callback_data="empty")
+        ])
+
+    return kb
+
+def get_training_users_kb(training_id):
+    kb = InlineKeyboardMarkup(inline_keyboard=[])
+
+    cursor.execute(
+        "SELECT user_id, username FROM bookings WHERE training_id=? ORDER BY username COLLATE NOCASE",
+        (training_id,)
+    )
+    users = cursor.fetchall()
+
+    for booked_user_id, username in users:
+        kb.inline_keyboard.append([
+            InlineKeyboardButton(
+                text=username,
+                callback_data=f"admin_manage_user_{training_id}_{booked_user_id}"
+            )
+        ])
+
+    kb.inline_keyboard.append([
+        InlineKeyboardButton(text="⬅️ К тренировкам", callback_data="admin_manage_back")
+    ])
+    return kb
+
+def get_manage_user_action_kb(training_id, booked_user_id):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(
+                text="❌ Отменить запись",
+                callback_data=f"admin_cancel_booking_{training_id}_{booked_user_id}"
+            )],
+            [InlineKeyboardButton(
+                text="🔁 Перенести",
+                callback_data=f"admin_move_booking_{training_id}_{booked_user_id}"
+            )],
+            [InlineKeyboardButton(
+                text="⬅️ К участникам",
+                callback_data=f"admin_manage_training_{training_id}"
+            )]
+        ]
+    )
+
+def get_move_target_kb(from_training_id, booked_user_id):
+    kb = InlineKeyboardMarkup(inline_keyboard=[])
+
+    cursor.execute("SELECT username FROM bookings WHERE user_id=? AND training_id=?", (booked_user_id, from_training_id))
+    row = cursor.fetchone()
+    username = row[0] if row else "Участник"
+
+    for t_id, name, date, time, slots in get_active_trainings():
+        if t_id == from_training_id:
+            continue
+
+        cursor.execute("SELECT COUNT(*) FROM bookings WHERE training_id=?", (t_id,))
+        count = cursor.fetchone()[0]
+        if count >= slots:
+            continue
+
+        cursor.execute("SELECT 1 FROM bookings WHERE user_id=? AND training_id=?", (booked_user_id, t_id))
+        if cursor.fetchone():
+            continue
+
+        kb.inline_keyboard.append([
+            InlineKeyboardButton(
+                text=f"{get_training_display(name, date, time)} ({slots - count})",
+                callback_data=f"admin_move_to_{from_training_id}_{booked_user_id}_{t_id}"
+            )
+        ])
+
+    if not kb.inline_keyboard:
+        kb.inline_keyboard.append([
+            InlineKeyboardButton(text=f"Нет вариантов для {username}", callback_data="empty")
+        ])
+
+    kb.inline_keyboard.append([
+        InlineKeyboardButton(
+            text="⬅️ К действиям",
+            callback_data=f"admin_manage_user_{from_training_id}_{booked_user_id}"
+        )
+    ])
+    return kb
+
+async def notify_waitlist(training_id):
+    cursor.execute("SELECT user_id FROM waitlist WHERE training_id=?", (training_id,))
+    wait_users = cursor.fetchall()
+
+    for (wait_user_id,) in wait_users:
+        try:
+            await bot.send_message(
+                wait_user_id,
+                "🔥 Освободилось место на тренировку!\n\nУспей записаться 💪"
+            )
+        except:
+            pass
+
+    cursor.execute("DELETE FROM waitlist WHERE training_id=?", (training_id,))
+    conn.commit()
+
 # ===== ДАТА =====
 def format_date(date_str):
     dt = datetime.strptime(date_str, "%d.%m.%Y")
@@ -107,12 +539,17 @@ def cleanup_trainings():
             # 🔹 берём всех записанных
             cursor.execute("SELECT user_id, username FROM bookings WHERE training_id=?", (t_id,))
             users = cursor.fetchall()
+            attendees = []
 
             for user_id, username in users:
+                attendees.append(username)
                 cursor.execute(
                     "INSERT INTO history VALUES (?, ?, ?, ?, ?)",
                     (user_id, username, name, date, time)
                 )
+                upsert_visit_count(username)
+
+            append_completed_training(date, time, name, attendees)
 
             # удаляем
             cursor.execute("DELETE FROM trainings WHERE id=?", (t_id,))
@@ -128,6 +565,7 @@ def get_main_kb(user_id):
             keyboard=[
                 [KeyboardButton(text="💪🏻 Записаться")],
                 [KeyboardButton(text="✅ Мои записи")],
+                [KeyboardButton(text="📏 Добавить замеры")],
                 [KeyboardButton(text="⚙️ Админка")]
             ],
             resize_keyboard=True
@@ -147,6 +585,7 @@ def get_admin_kb():
         keyboard=[
             [KeyboardButton(text="➕ Добавить тренировку")],
             [KeyboardButton(text="🗑️ Удалить тренировку")],
+            [KeyboardButton(text="🔁 Управление записями")],
             [KeyboardButton(text="📋 Список участников")],
             [KeyboardButton(text="📊 Посещения")],
             [KeyboardButton(text="📈 Отчет веса")],  # ← для админа
@@ -155,7 +594,22 @@ def get_admin_kb():
         resize_keyboard=True
     )
 
-# ===== СПИСОК ТРЕНИРОВОК =====
+def get_measurement_cancel_kb():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="⬅️ Назад")]
+        ],
+        resize_keyboard=True
+    )
+
+def get_clear_list_kb(action):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🗑️ Очистить", callback_data=action)]
+        ]
+    )
+
+# ===== РЎРџРРЎРћРљ РўР Р•РќРР РћР’РћРљ =====
 def get_trainings_kb():
     kb = InlineKeyboardMarkup(inline_keyboard=[])
 
@@ -191,7 +645,7 @@ def get_trainings_kb():
 
     return kb
 
-# ===== УДАЛЕНИЕ =====
+# ===== РЈР”РђР›Р•РќРР• =====
 def get_delete_kb():
     kb = InlineKeyboardMarkup(inline_keyboard=[])
 
@@ -210,7 +664,7 @@ def get_delete_kb():
 
     return kb
 
-# ===== НАПОМИНАНИЯ =====
+# ===== РќРђРџРћРњРРќРђРќРРЇ =====
 async def reminder_loop():
     while True:
         now = datetime.now()
@@ -265,7 +719,7 @@ async def reminder_loop():
 
         await asyncio.sleep(60)
 
-# ===== АВТООЧИСТКА =====
+# ===== РђР’РўРћРћР§РРЎРўРљРђ =====
 async def cleanup_loop():
     while True:
         print(f"Проверка очистки: {datetime.now()}")
@@ -351,10 +805,13 @@ async def handle(message: types.Message, state: FSMContext):
         await message.answer("Меню 👇", reply_markup=get_main_kb(message.from_user.id))
 
     elif message.text == "📏 Добавить замеры":
-        await message.answer("Введите дату замеров (дд.мм), без года:")
+        await message.answer(
+            "Введите дату замеров (дд.мм), без года:",
+            reply_markup=get_measurement_cancel_kb()
+        )
         await state.set_state(AddMeasurement.date)
 
-    # ===== ОТЧЕТ ВЕСА ДЛЯ АДМИНА =====
+    # ===== РћРўР§Р•Рў Р’Р•РЎРђ Р”Р›РЇ РђР”РњРРќРђ =====
     elif message.text == "📈 Отчет веса" and message.from_user.id == ADMIN_ID:
         cursor.execute("SELECT DISTINCT user_id, username FROM measurements")
         users = cursor.fetchall()
@@ -383,9 +840,13 @@ async def handle(message: types.Message, state: FSMContext):
                 text += f"  {date} — {weight} кг\n"
             text += f"  Разница: {diff:+.1f} кг\n"
 
-        await message.answer(text, parse_mode="HTML")
+        await message.answer(
+            text,
+            parse_mode="HTML",
+            reply_markup=get_clear_list_kb("clear_measurements")
+        )
 
-    # ===== СПИСОК УЧАСТНИКОВ =====
+    # ===== РЎРџРРЎРћРљ РЈР§РђРЎРўРќРРљРћР’ =====
     elif message.text == "📋 Список участников":
         if message.from_user.id != ADMIN_ID:
             return
@@ -413,7 +874,21 @@ async def handle(message: types.Message, state: FSMContext):
 
         await message.answer(text or "Пусто", parse_mode="HTML")
 
-    # ===== ПОСЕЩЕНИЯ =====
+    elif message.text == "🔁 Управление записями":
+        if message.from_user.id != ADMIN_ID:
+            return
+
+        kb = get_manage_bookings_kb()
+        if kb.inline_keyboard[0][0].text == "Нет записей":
+            await message.answer("Сейчас нет активных записей.")
+            return
+
+        await message.answer(
+            "Выбери тренировку, где нужно отменить или перенести запись:",
+            reply_markup=kb
+        )
+
+    # ===== РџРћРЎР•Р©Р•РќРРЇ =====
     elif message.text == "📊 Посещения":
         if message.from_user.id != ADMIN_ID:
             return
@@ -442,9 +917,9 @@ async def handle(message: types.Message, state: FSMContext):
 
             text += f"{username} — {visits} {word}\n"
 
-        await message.answer(text)
+        await message.answer(text, reply_markup=get_clear_list_kb("clear_history"))
 
-    # ===== ДОБАВИТЬ ТРЕНИРОВКУ =====
+    # ===== Р”РћР‘РђР’РРўР¬ РўР Р•РќРР РћР’РљРЈ =====
     elif message.text == "➕ Добавить тренировку":
         if message.from_user.id != ADMIN_ID:
             return
@@ -452,7 +927,7 @@ async def handle(message: types.Message, state: FSMContext):
         await message.answer("Введите название:")
         await state.set_state(AddTraining.name)
 
-    # ===== УДАЛИТЬ =====
+    # ===== РЈР”РђР›РРўР¬ =====
     elif message.text == "🗑️ Удалить тренировку":
         if message.from_user.id != ADMIN_ID:
             return
@@ -530,11 +1005,19 @@ async def add_slots(message: types.Message, state: FSMContext):
 # ===== FSM ХЕНДЛЕРЫ ДЛЯ ЗАМЕРОВ =====
 @dp.message(AddMeasurement.date)
 async def add_measurement_date(message: types.Message, state: FSMContext):
+    if message.text == "⬅️ Назад":
+        await state.clear()
+        await message.answer("Меню 👇", reply_markup=get_main_kb(message.from_user.id))
+        return
+
     user_input = message.text.strip()
     try:
-        datetime.strptime(user_input, "%d.%m")
+        datetime.strptime(f"{user_input}.2000", "%d.%m.%Y")
         await state.update_data(date=user_input)
-        await message.answer("Введите вес (кг), можно через точку или запятую:")
+        await message.answer(
+            "Введите вес (кг), можно через точку или запятую:",
+            reply_markup=get_measurement_cancel_kb()
+        )
         await state.set_state(AddMeasurement.weight)
     except:
         await message.answer("❌ Неверный формат даты! Введите дд.мм, например 25.03")
@@ -542,6 +1025,11 @@ async def add_measurement_date(message: types.Message, state: FSMContext):
 
 @dp.message(AddMeasurement.weight)
 async def add_measurement_weight(message: types.Message, state: FSMContext):
+    if message.text == "⬅️ Назад":
+        await state.clear()
+        await message.answer("Меню 👇", reply_markup=get_main_kb(message.from_user.id))
+        return
+
     data = await state.get_data()
     user_id = message.from_user.id
     username = message.from_user.username or message.from_user.full_name
@@ -558,11 +1046,12 @@ async def add_measurement_weight(message: types.Message, state: FSMContext):
         (user_id, username, data["date"], weight)
     )
     conn.commit()
+    upsert_measurement_row(username, data["date"], weight)
 
-    await message.answer(f"📏 Замер добавлен: {data['date']} — {weight} кг")
+    await message.answer(f"📏 Замер добавлен: {data['date']} — {weight} кг", reply_markup=get_main_kb(message.from_user.id))
     await state.clear()
 
-@dp.callback_query(lambda c: c.data.startswith(("book_", "cancel_", "delete_", "wait_")))
+@dp.callback_query(lambda c: c.data.startswith(("book_", "cancel_", "delete_", "wait_", "clear_", "admin_")))
 async def callbacks(callback: types.CallbackQuery):
     cleanup_trainings()
     await callback.answer()
@@ -570,7 +1059,7 @@ async def callbacks(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     data = callback.data
 
-    # ===== ЗАПИСЬ НА ТРЕНИРОВКУ =====
+    # ===== Р—РђРџРРЎР¬ РќРђ РўР Р•РќРР РћР’РљРЈ =====
     if data.startswith("book_"):
         t_id = int(data.split("_")[1])
 
@@ -671,30 +1160,9 @@ async def callbacks(callback: types.CallbackQuery):
 
         await callback.message.answer("Запись отменена ❌")
 
-        # 🔔 уведомление очереди
-        cursor.execute(
-            "SELECT user_id FROM waitlist WHERE training_id=?",
-            (t_id,)
-        )
-        wait_users = cursor.fetchall()
+        await notify_waitlist(t_id)
 
-        for (u_id,) in wait_users:
-            try:
-                await bot.send_message(
-                    u_id,
-                    "🔥 Освободилось место на тренировку!\n\nУспей записаться 💪"
-                )
-            except:
-                pass
-
-        # Очистка очереди после уведомления
-        cursor.execute(
-            "DELETE FROM waitlist WHERE training_id=?",
-            (t_id,)
-        )
-        conn.commit()
-
-    # ===== УДАЛЕНИЕ =====
+    # ===== РЈР”РђР›Р•РќРР• =====
     elif data.startswith("delete_"):
         if user_id != ADMIN_ID:
             return
@@ -750,9 +1218,217 @@ async def callbacks(callback: types.CallbackQuery):
         conn.commit()
 
         await callback.message.answer("Ты добавлена в список ожидания ⏳")
-# ===== ЗАПУСК =====
+
+    elif data == "admin_manage_back":
+        if user_id != ADMIN_ID:
+            return
+
+        await callback.message.answer(
+            "Выбери тренировку, где нужно отменить или перенести запись:",
+            reply_markup=get_manage_bookings_kb()
+        )
+
+    elif data.startswith("admin_manage_training_"):
+        if user_id != ADMIN_ID:
+            return
+
+        training_id = int(data.split("_")[-1])
+        cursor.execute("SELECT name, date, time FROM trainings WHERE id=?", (training_id,))
+        training = cursor.fetchone()
+        if not training:
+            await callback.message.answer("Тренировка не найдена.")
+            return
+
+        name, date, time = training
+        await callback.message.answer(
+            f"Участники тренировки {get_training_display(name, date, time)}:",
+            reply_markup=get_training_users_kb(training_id)
+        )
+
+    elif data.startswith("admin_manage_user_"):
+        if user_id != ADMIN_ID:
+            return
+
+        _, _, _, training_id, booked_user_id = data.split("_")
+        training_id = int(training_id)
+        booked_user_id = int(booked_user_id)
+
+        cursor.execute(
+            """SELECT b.username, t.name, t.date, t.time
+               FROM bookings b
+               JOIN trainings t ON t.id = b.training_id
+               WHERE b.training_id=? AND b.user_id=?""",
+            (training_id, booked_user_id)
+        )
+        row = cursor.fetchone()
+        if not row:
+            await callback.message.answer("Запись не найдена.")
+            return
+
+        username, name, date, time = row
+        await callback.message.answer(
+            f"Что сделать с {username}?\n\nТекущая тренировка: {get_training_display(name, date, time)}",
+            reply_markup=get_manage_user_action_kb(training_id, booked_user_id)
+        )
+
+    elif data.startswith("admin_cancel_booking_"):
+        if user_id != ADMIN_ID:
+            return
+
+        _, _, _, training_id, booked_user_id = data.split("_")
+        training_id = int(training_id)
+        booked_user_id = int(booked_user_id)
+
+        cursor.execute(
+            """SELECT b.username, t.name, t.date, t.time
+               FROM bookings b
+               JOIN trainings t ON t.id = b.training_id
+               WHERE b.training_id=? AND b.user_id=?""",
+            (training_id, booked_user_id)
+        )
+        row = cursor.fetchone()
+        if not row:
+            await callback.message.answer("Запись уже отсутствует.")
+            return
+
+        username, name, date, time = row
+        cursor.execute(
+            "DELETE FROM bookings WHERE user_id=? AND training_id=?",
+            (booked_user_id, training_id)
+        )
+        conn.commit()
+
+        try:
+            await bot.send_message(
+                booked_user_id,
+                f"❌ Администратор отменил твою запись на тренировку\n\n{get_training_display(name, date, time)}"
+            )
+        except:
+            pass
+
+        await notify_waitlist(training_id)
+        await callback.message.answer(f"Запись {username} отменена.")
+
+    elif data.startswith("admin_move_booking_"):
+        if user_id != ADMIN_ID:
+            return
+
+        _, _, _, training_id, booked_user_id = data.split("_")
+        training_id = int(training_id)
+        booked_user_id = int(booked_user_id)
+
+        cursor.execute(
+            """SELECT b.username, t.name, t.date, t.time
+               FROM bookings b
+               JOIN trainings t ON t.id = b.training_id
+               WHERE b.training_id=? AND b.user_id=?""",
+            (training_id, booked_user_id)
+        )
+        row = cursor.fetchone()
+        if not row:
+            await callback.message.answer("Запись не найдена.")
+            return
+
+        username, name, date, time = row
+        await callback.message.answer(
+            f"Куда перенести {username}?\n\nСейчас: {get_training_display(name, date, time)}",
+            reply_markup=get_move_target_kb(training_id, booked_user_id)
+        )
+
+    elif data.startswith("admin_move_to_"):
+        if user_id != ADMIN_ID:
+            return
+
+        _, _, _, from_training_id, booked_user_id, to_training_id = data.split("_")
+        from_training_id = int(from_training_id)
+        booked_user_id = int(booked_user_id)
+        to_training_id = int(to_training_id)
+
+        cursor.execute(
+            """SELECT b.username, t.name, t.date, t.time
+               FROM bookings b
+               JOIN trainings t ON t.id = b.training_id
+               WHERE b.training_id=? AND b.user_id=?""",
+            (from_training_id, booked_user_id)
+        )
+        from_row = cursor.fetchone()
+        if not from_row:
+            await callback.message.answer("Исходная запись не найдена.")
+            return
+
+        username, from_name, from_date, from_time = from_row
+
+        cursor.execute("SELECT name, date, time, slots FROM trainings WHERE id=?", (to_training_id,))
+        to_row = cursor.fetchone()
+        if not to_row:
+            await callback.message.answer("Целевая тренировка не найдена.")
+            return
+
+        to_name, to_date, to_time, to_slots = to_row
+        cursor.execute("SELECT COUNT(*) FROM bookings WHERE training_id=?", (to_training_id,))
+        to_count = cursor.fetchone()[0]
+        if to_count >= to_slots:
+            await callback.message.answer("На выбранную тренировку уже нет мест.")
+            return
+
+        cursor.execute(
+            "SELECT 1 FROM bookings WHERE user_id=? AND training_id=?",
+            (booked_user_id, to_training_id)
+        )
+        if cursor.fetchone():
+            await callback.message.answer("Этот участник уже записан на выбранную тренировку.")
+            return
+
+        cursor.execute(
+            "UPDATE bookings SET training_id=? WHERE user_id=? AND training_id=?",
+            (to_training_id, booked_user_id, from_training_id)
+        )
+        cursor.execute(
+            "DELETE FROM waitlist WHERE user_id=? AND training_id=?",
+            (booked_user_id, to_training_id)
+        )
+        conn.commit()
+
+        try:
+            await bot.send_message(
+                booked_user_id,
+                "🔁 Администратор перенес твою запись на другую тренировку\n\n"
+                f"Было: {get_training_display(from_name, from_date, from_time)}\n"
+                f"Стало: {get_training_display(to_name, to_date, to_time)}"
+            )
+        except:
+            pass
+
+        await notify_waitlist(from_training_id)
+        await callback.message.answer(
+            f"{username} перенесен(а).\n\n"
+            f"Было: {get_training_display(from_name, from_date, from_time)}\n"
+            f"Стало: {get_training_display(to_name, to_date, to_time)}"
+        )
+
+    elif data == "clear_history":
+        if user_id != ADMIN_ID:
+            return
+
+        cursor.execute("DELETE FROM history")
+        conn.commit()
+        await callback.message.answer("Список посещений очищен 🗑️")
+
+    elif data == "clear_measurements":
+        if user_id != ADMIN_ID:
+            return
+
+        cursor.execute("DELETE FROM measurements")
+        conn.commit()
+        await callback.message.answer("Список замеров очищен 🗑️")
+
 async def main():
     print("Бот запущен 🚀")
+
+    if init_google_sheets():
+        print("Google Sheets подключен")
+    else:
+        print("Google Sheets недоступен, бот продолжит работу с локальной базой")
 
     cleanup_trainings()  # 👈 сразу при старте
 
