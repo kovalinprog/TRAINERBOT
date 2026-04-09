@@ -12,7 +12,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 TOKEN = "8626742579:AAFp06-KUYOzJ_e-qGDRyuWn7Gvs-mzpVoQ"
-ADMIN_ID = 932779989
+ADMIN_ID = 76038670
 SPREADSHEET_ID = "16DnKUsc2KZ5foX9jf4RoNU5VBvqqPVM_XPVqnFvyFhU"
 GOOGLE_CREDENTIALS_FILE = "trainerbot-492814-fc3ec93852f5.json"
 GOOGLE_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
