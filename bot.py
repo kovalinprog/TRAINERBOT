@@ -29,7 +29,10 @@ sheets_service = None
 sheets_initialized = False
 
 # ===== БАЗА =====
-conn = sqlite3.connect("db.sqlite3", check_same_thread=False)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+db_path = os.path.join(BASE_DIR, "db.sqlite3")
+
+conn = sqlite3.connect(db_path, check_same_thread=False)
 cursor = conn.cursor()
 
 cursor.execute("""
