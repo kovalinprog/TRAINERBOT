@@ -1,3 +1,0 @@
-aiogram
-google-api-python-client
-google-auth
