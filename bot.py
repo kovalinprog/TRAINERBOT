@@ -23,7 +23,7 @@ VISITS_SHEET_NAME = "Посещения"
 MEASUREMENTS_SHEET_NAME = "Замеры"
 COMPLETED_TRAININGS_SHEET_NAME = "Прошедшие тренировки"
 VISITS_HEADERS = ["Ник", "Посещений"]
-MEASUREMENTS_ROW_LABEL = "вес"
+MEASUREMENTS_HEADERS = ["Ник", "Дата", "Вес"]
 COMPLETED_TRAININGS_HEADERS = ["Дата", "Время", "Тренировка", "Присутствовали"]
 
 try:
@@ -191,7 +191,7 @@ def init_google_sheets():
     try:
         ensure_sheet_exists(service, VISITS_SHEET_NAME, VISITS_HEADERS)
         ensure_sheet_exists(service, COMPLETED_TRAININGS_SHEET_NAME, COMPLETED_TRAININGS_HEADERS)
-        ensure_sheet_exists(service, MEASUREMENTS_SHEET_NAME, [])
+        ensure_sheet_exists(service, MEASUREMENTS_SHEET_NAME, MEASUREMENTS_HEADERS)
         sheets_initialized = True
         return True
     except HttpError as e:
@@ -306,94 +306,11 @@ def upsert_visit_count(username):
         print(f"Google Sheets unexpected visit upsert error: {e}")
         return False
 
-def upsert_measurement_row(username, date, weight):
-    if not init_google_sheets():
-        return False
-
-    service = get_sheets_service()
-    try:
-        result = service.spreadsheets().values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f"'{MEASUREMENTS_SHEET_NAME}'!A:ZZ"
-        ).execute()
-        values = result.get("values", [])
-
-        target_name_row = None
-        target_weight_row = None
-        next_free_row = 1
-
-        if values:
-            next_free_row = len(values) + 1
-            if next_free_row % 2 == 0:
-                next_free_row += 1
-
-        for index, row in enumerate(values, start=1):
-            if row and row[0] == username:
-                target_name_row = index
-                target_weight_row = index + 1
-                break
-
-        if target_name_row is None:
-            target_name_row = next_free_row
-            target_weight_row = next_free_row + 1
-            service.spreadsheets().values().update(
-                spreadsheetId=SPREADSHEET_ID,
-                range=f"'{MEASUREMENTS_SHEET_NAME}'!A{target_name_row}:A{target_weight_row}",
-                valueInputOption="USER_ENTERED",
-                body={"values": [[username], [MEASUREMENTS_ROW_LABEL]]}
-            ).execute()
-            name_row_values = [username]
-            weight_row_values = [MEASUREMENTS_ROW_LABEL]
-        else:
-            name_row_values = values[target_name_row - 1] if len(values) >= target_name_row else [username]
-            weight_row_values = values[target_weight_row - 1] if len(values) >= target_weight_row else [MEASUREMENTS_ROW_LABEL]
-
-        start_column = len(weight_row_values) + 1
-        if start_column < 2:
-            start_column = 2
-
-        date_column = get_column_letter(start_column)
-        weight_column = date_column
-
-        service.spreadsheets().values().update(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f"'{MEASUREMENTS_SHEET_NAME}'!{date_column}{target_name_row}:{weight_column}{target_weight_row}",
-            valueInputOption="USER_ENTERED",
-            body={"values": [[date], [weight]]}
-        ).execute()
-
-        updated_name_range = service.spreadsheets().values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f"'{MEASUREMENTS_SHEET_NAME}'!A{target_name_row}:ZZ{target_name_row}"
-        ).execute().get("values", [[]])[0]
-        updated_weight_range = service.spreadsheets().values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f"'{MEASUREMENTS_SHEET_NAME}'!A{target_weight_row}:ZZ{target_weight_row}"
-        ).execute().get("values", [[]])[0]
-
-        weight_values = []
-        for cell in updated_weight_range[1:]:
-            try:
-                weight_values.append(float(str(cell).replace(",", ".")))
-            except:
-                continue
-
-        if weight_values:
-            diff_text = f"Разница: {weight_values[-1] - weight_values[0]:+.1f} кг"
-            diff_column = get_column_letter(len(updated_weight_range) + 1)
-            service.spreadsheets().values().update(
-                spreadsheetId=SPREADSHEET_ID,
-                range=f"'{MEASUREMENTS_SHEET_NAME}'!{diff_column}{target_name_row}",
-                valueInputOption="USER_ENTERED",
-                body={"values": [[diff_text]]}
-            ).execute()
-        return True
-    except HttpError as e:
-        print(f"Google Sheets measurement upsert error: {e}")
-        return False
-    except Exception as e:
-        print(f"Google Sheets unexpected measurement upsert error: {e}")
-        return False
+def append_measurement_row(username, date, weight):
+    return append_google_row(
+        MEASUREMENTS_SHEET_NAME,
+        [username, date, weight]
+    )
 
 def append_completed_training(date, time, training_name, attendees):
     attendees_text = ", ".join(attendees) if attendees else "Никто"
@@ -855,15 +772,9 @@ async def handle(message: types.Message, state: FSMContext):
             if not records:
                 continue
 
-            first_weight = records[0][1]
-            last_weight = records[-1][1]
-            diff = last_weight - first_weight
-
-            # Ссылка на профиль участника
             text += f"\n<a href='tg://user?id={user_id}'>{username}</a>:\n"
             for date, weight in records:
                 text += f"  {date} — {weight} кг\n"
-            text += f"  Разница: {diff:+.1f} кг\n"
 
         await message.answer(
             text,
@@ -1071,7 +982,7 @@ async def add_measurement_weight(message: types.Message, state: FSMContext):
         (user_id, username, data["date"], weight)
     )
     conn.commit()
-    upsert_measurement_row(username, data["date"], weight)
+    append_measurement_row(username, data["date"], weight)
 
     await message.answer(f"📏 Замер добавлен: {data['date']} — {weight} кг", reply_markup=get_main_kb(message.from_user.id))
     await state.clear()
